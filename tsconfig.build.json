@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "tsbuild",
+    "rootDir": "src",
+    "declaration": true,
+    "sourceMap": true,
+    "target": "es2022",
+    "noCheck": true,
+    "declarationDir": "types"
+  },
+  "include": [
+    "src"
+  ]
+}

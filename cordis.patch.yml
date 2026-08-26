@@ -1,0 +1,54 @@
+# dsh-tasks-manager — session todos and a durable project task board.
+#
+# All three rows are composed by default, because unlike a provider-backed capability nothing here
+# needs a deployment-specific answer to work: the board is a SQLite file this plugin creates inside
+# the project the session was opened in.
+#
+# Override any row from your profile's own cordis.patch.yml by `id`, restating every key the row
+# needs — a patch replaces a row's whole `config`.
+- insert:
+    # The board itself: one SQLite database per project, the RPC channel the Web Client drives it
+    # through, and the settings section that owns these preferences at runtime.
+    - id: tasks
+      name: '@achasoft/dsh-tasks-manager/host'
+      config:
+        # Relative, so one installation serves a different board per project. Make it absolute to
+        # pin every project to one shared board instead.
+        databasePath: .dsh/tasks.db
+        # Walked upwards from the session's directory; the first match is the project root. A
+        # session outside any of these gets a board rooted at its own directory.
+        projectRootMarkers:
+          - .git
+        defaultStatus: backlog
+        # New work belongs where it will be seen. Set `bottom` for a strict intake queue.
+        newTaskPlacement: top
+        journalMode: wal
+        busyTimeoutMs: 5000
+        # How stale the open board may be when the change came from somewhere this browser cannot
+        # observe: the agent, another session, or `sqlite3` at a terminal. Only the revision counter
+        # is polled at this rate; the cards are re-read solely when it moves.
+        pollIntervalMs: 2000
+        # Dispatching a card to the agent needs a subagent provider by name, and no default can
+        # supply one — an unset value leaves the Dispatch action disabled and says why.
+        # Set it to a provider your profile composes, e.g. `spawn-in-process`.
+        subagentProvider: ''
+        dispatchStatus: in_progress
+        # Left at `none` deliberately: whether a finished run means the work is done is a judgement
+        # the run cannot make for itself. Set a column to move dispatched cards automatically.
+        dispatchCompletedStatus: none
+        digestSize: 25
+
+    # The model-facing tools. Split from the board row so a deployment can serve the board to
+    # people without giving the model write access to it — disable this row alone.
+    - id: tasks-tools
+      name: '@achasoft/dsh-tasks-manager/tools'
+      config:
+        # Archiving is recoverable and deleting is not. Turn this on only if you want the model able
+        # to destroy a card, its comments, and its history in one call.
+        allowDelete: false
+        defaultListLimit: 50
+
+    # The BARE package name, deliberately: the Web Client discovers a browser half by resolving
+    # `<row name>/package.json`, so a subpath row here would leave the Tasks view silently unserved.
+    - id: tasks-ui
+      name: '@achasoft/dsh-tasks-manager'

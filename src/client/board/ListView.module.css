@@ -1,0 +1,260 @@
+/* Dense list layout. Every colour is an alias token; none is a literal. */
+
+.scroll {
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 16px 16px;
+  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l1);
+  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l1);
+}
+
+.table {
+  width: 100%;
+  min-width: 720px;
+  border-collapse: separate;
+  border-spacing: 0;
+  font: 13px/20px var(--dsw-font-family);
+}
+
+.th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 0;
+  text-align: left;
+  background: var(--dsw-alias-bg-base);
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  white-space: nowrap;
+}
+
+.sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 8px 10px;
+  background: none;
+  border: 0;
+  font: 500 12px/18px var(--dsw-font-family);
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.sort:hover {
+  color: var(--dsw-alias-label-primary);
+}
+
+.sort:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px;
+}
+
+.row {
+  cursor: pointer;
+}
+
+.row:hover .td {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.selected .td {
+  background: var(--dsw-alias-state-business-tertiary);
+}
+
+.archived .td {
+  opacity: 0.65;
+}
+
+.td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--dsw-alias-border-l1);
+  color: var(--dsw-alias-label-primary);
+  vertical-align: top;
+}
+
+/* Header column widths. Named `col*` so they cannot collide with the body-cell classes below —
+   a `<th>` carrying `.status` would render as a status pill. */
+.colRef {
+  width: 56px;
+}
+
+.colTitle {
+  min-width: 240px;
+}
+
+.colStatus,
+.colPriority {
+  width: 120px;
+}
+
+.colAssignee,
+.colDue,
+.colUpdated {
+  width: 110px;
+}
+
+.ref {
+  width: 56px;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-caption);
+}
+
+.titleCell {
+  min-width: 240px;
+}
+
+.title {
+  display: block;
+  padding: 0;
+  background: none;
+  border: 0;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.title:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 2px;
+}
+
+.muted {
+  color: var(--dsw-alias-label-caption);
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.label {
+  font: 11px/16px var(--dsw-font-family);
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-tertiary);
+}
+
+.status[data-status='in_progress']::before {
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.status[data-status='blocked']::before {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.status[data-status='done']::before {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.priority {
+  color: var(--dsw-alias-label-caption);
+  white-space: nowrap;
+}
+
+.priority[data-priority='urgent'] {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 500;
+}
+
+.priority[data-priority='high'] {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.priority[data-priority='low'] {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.due {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.due[data-tone='soon'],
+.due[data-tone='today'] {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.due[data-tone='overdue'] {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 500;
+}
+
+.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--dsw-alias-state-business-tertiary);
+  color: var(--dsw-alias-state-business-primary);
+  font: 500 11px/16px var(--dsw-font-family);
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.actions {
+  width: 44px;
+  text-align: right;
+}
+
+.menuButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.menuButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.menuButton:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation: none;
+  }
+}

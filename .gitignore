@@ -1,0 +1,18 @@
+# Build output — reproduced by `pnpm run build` (tsc emit → tsdown bundle).
+lib/
+types/
+tsbuild/
+*.tsbuildinfo
+
+# Packing artifacts
+*.tgz
+
+# Dependencies
+node_modules/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# JetBrains
+.idea/

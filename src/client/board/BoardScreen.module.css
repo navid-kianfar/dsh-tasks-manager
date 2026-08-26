@@ -1,0 +1,162 @@
+/* Board screen shell. Every colour is an alias token; none is a literal. */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--dsw-alias-bg-base);
+}
+
+/* The detail panel is absolutely positioned inside this box, so it covers the board rather than
+   squeezing the columns to an unusable width. */
+.body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  padding: 4px 16px 6px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.path {
+  font: 11px/16px var(--ds-font-family-code);
+  color: var(--dsw-alias-label-dimmed);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.composerIcon {
+  color: var(--dsw-alias-label-tertiary);
+  flex: 0 0 auto;
+}
+
+.composerInput {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 0;
+  font: 14px/22px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  background: none;
+  border: 0;
+  outline: none;
+}
+
+.composerInput::placeholder {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.composerHint {
+  flex: 0 0 auto;
+  font: 11px/16px var(--dsw-font-family);
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.empty,
+.failure {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 100%;
+  padding: 32px 24px;
+  text-align: center;
+}
+
+.emptyTitle {
+  margin: 0;
+  font: 500 16px/24px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+}
+
+.emptyBody {
+  margin: 0 0 8px;
+  max-width: 52ch;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-caption);
+}
+
+.failure .emptyBody {
+  color: var(--dsw-alias-state-error-primary);
+  font-family: var(--ds-font-family-code);
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+
+.skeletons {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(260px, 1fr);
+  gap: 12px;
+  height: 100%;
+  padding: 12px 16px 16px;
+  overflow: hidden;
+}
+
+.skeletonColumn {
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-skeleton);
+  animation: pulse 1.4s var(--ds-ease-in-out) infinite;
+}
+
+.skeletonColumn:nth-child(2) {
+  animation-delay: 0.1s;
+}
+
+.skeletonColumn:nth-child(3) {
+  animation-delay: 0.2s;
+}
+
+.skeletonColumn:nth-child(4) {
+  animation-delay: 0.3s;
+}
+
+.skeletonColumn:nth-child(5) {
+  animation-delay: 0.4s;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeletonColumn {
+    animation: none;
+  }
+}

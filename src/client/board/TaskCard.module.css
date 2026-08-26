@@ -1,0 +1,253 @@
+/* Board card. Every colour is an alias token; none is a literal. */
+
+.card {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  background: var(--dsw-alias-bg-layer-3);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  box-shadow: var(--dsw-shadow-lv1);
+  transition:
+    box-shadow var(--ds-transition-duration-fast) var(--ds-ease-in-out),
+    border-color var(--ds-transition-duration-fast) var(--ds-ease-in-out),
+    opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.card:hover {
+  border-color: var(--dsw-alias-border-l3);
+  box-shadow: var(--dsw-shadow-lv2);
+}
+
+/* The left edge carries priority, so urgency survives a monochrome scan of the column. */
+.card[data-priority='urgent']::before,
+.card[data-priority='high']::before {
+  content: '';
+  position: absolute;
+  inset: 8px auto 8px 0;
+  width: 2px;
+  border-radius: 999px;
+}
+
+.card[data-priority='urgent']::before {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.card[data-priority='high']::before {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.selected {
+  border-color: var(--dsw-alias-state-business-primary);
+  box-shadow: var(--dsw-shadow-lv2);
+}
+
+/* Every other card fades while one is being dragged, so the drop target reads as the live one. */
+.dimmed {
+  opacity: 0.55;
+}
+
+.archived {
+  border-style: dashed;
+}
+
+.body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 4px 10px 12px;
+  background: none;
+  border: 0;
+  border-radius: 12px;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.body:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: -2px;
+}
+
+.head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 16px;
+}
+
+.ref {
+  font: 500 11px/14px var(--dsw-font-family);
+  color: var(--dsw-alias-label-caption);
+  font-variant-numeric: tabular-nums;
+}
+
+.priority {
+  font: 500 11px/14px var(--dsw-font-family);
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-secondary);
+}
+
+.priority[data-priority='urgent'] {
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.priority[data-priority='high'] {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.priority[data-priority='low'] {
+  color: var(--dsw-alias-label-dimmed);
+}
+
+.badge {
+  font: 500 11px/14px var(--dsw-font-family);
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.title {
+  font: 14px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.label {
+  font: 11px/16px var(--dsw-font-family);
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--dsw-alias-bg-module-platform);
+  color: var(--dsw-alias-label-tertiary);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 0;
+  font: 11px/16px var(--dsw-font-family);
+  color: var(--dsw-alias-label-caption);
+}
+
+.meta:empty {
+  display: none;
+}
+
+.running {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--dsw-alias-state-business-tertiary);
+  color: var(--dsw-alias-state-business-primary);
+  font-weight: 500;
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.due[data-tone='soon'] {
+  color: var(--dsw-alias-state-warn-label);
+}
+
+.due[data-tone='today'] {
+  color: var(--dsw-alias-state-warn-label);
+  font-weight: 500;
+}
+
+.due[data-tone='overdue'] {
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 500;
+}
+
+.assignee {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.menuSeat {
+  flex: 0 0 auto;
+  padding: 8px 6px 0 0;
+}
+
+.menuButton {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--ds-transition-duration-fast) var(--ds-ease-in-out);
+}
+
+.card:hover .menuButton,
+.menuButton:focus-visible,
+.menuButton[aria-expanded='true'] {
+  opacity: 1;
+}
+
+.menuButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-primary);
+}
+
+.menuButton:focus-visible {
+  outline: 2px solid var(--dsw-alias-state-business-primary);
+  outline-offset: 1px;
+}
+
+/* Touch and keyboard users never produce the hover that reveals the menu. */
+@media (hover: none) {
+  .menuButton {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card,
+  .menuButton {
+    transition: none;
+  }
+
+  .spin {
+    animation: none;
+  }
+}

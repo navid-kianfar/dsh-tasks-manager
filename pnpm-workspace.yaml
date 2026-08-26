@@ -1,0 +1,7 @@
+packages:
+  - '.'
+
+# esbuild's postinstall fetches its own platform binary. It is a dev-only dependency of vitest and
+# never reaches consumers of this package.
+allowBuilds:
+  esbuild: true
