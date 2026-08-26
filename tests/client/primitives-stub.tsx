@@ -110,6 +110,7 @@ function icon(name: string) {
 }
 
 export const IconArchiveOutline20 = icon('archive')
+export const IconCheckOutline14 = icon('check')
 export const IconChevronDownOutline14 = icon('chevron-down')
 export const IconChevronUpOutline14 = icon('chevron-up')
 export const IconCloseFill14 = icon('close-fill')

@@ -18,6 +18,9 @@ import type { BoardView, TaskDetail as TaskDetailData, TaskPatch, TaskPlacement,
 import { TASK_STATUSES } from '../domain/types.ts'
 import type { JobView } from '../host/protocol.ts'
 import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
+// Type-only: pulls tool-todo's `todos` SessionProjectionMap merge so `useProjection('todos')` types.
+import type {} from '@deepseek-ai/dsh-tool-todo/client'
+import type { UseProjection } from '@deepseek-ai/dsh-client-runtime/client'
 import type { Config } from '../host/index.ts'
 import type { TasksApi } from './rpc.ts'
 import { TasksApiError } from './rpc.ts'
@@ -45,6 +48,13 @@ export type TasksViewProps = {
   useTaskSettings: <S>(select: (snapshot: SettingsScopeSnapshot<Config>) => S) => S
   /** The framework-resolved session id. */
   sessionId: string
+  /**
+   * The framework's key-addressed projection reader.
+   *
+   * Used for the `todos` key, which `@deepseek-ai/dsh-tool-todo` owns: the session checklist is the
+   * harness's, and this view reads it rather than keeping one of its own.
+   */
+  useProjection: UseProjection
   /** Translate, bound to this plugin's namespace. */
   t: BoardTranslate
 }
@@ -69,7 +79,14 @@ function inBoardOrder(tasks: BoardView['tasks']): BoardView['tasks'] {
 }
 
 /** Render the Tasks view. */
-export function TasksView({ api, useTaskSettings, sessionId, t }: TasksViewProps) {
+export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }: TasksViewProps) {
+  // Three states, and collapsing any two of them tells the reader something false. `undefined` is
+  // the framework's uniform "capability absent" — no todo plugin composed, so there is no checklist
+  // to speak of. `null` is the unit's own pre-first-write state: the checklist exists and is empty.
+  // An array is the list. `?? []` would claim an unavailable capability was merely empty.
+  const projectedTodos = useProjection('todos')
+  const todos = projectedTodos === undefined ? undefined : projectedTodos ?? []
+  const [promoted, setPromoted] = useState<string[]>([])
   const pollIntervalMs = useTaskSettings(snapshot => snapshot.value?.pollIntervalMs ?? FALLBACK_POLL_MS)
   const canDispatch = useTaskSettings(snapshot => (snapshot.value?.subagentProvider ?? '') !== '')
   // Deleting is always offered to the PERSON whose board this is; `allowDelete` gates the model's
@@ -229,6 +246,14 @@ export function TasksView({ api, useTaskSettings, sessionId, t }: TasksViewProps
     })
   }, [mutate, applyTask, api, sessionId, openId, loadDetail])
 
+  const promote = useCallback((content: string) => {
+    void mutate(async () => {
+      await api.call('task.create', { sessionId, task: { title: content } })
+      if (alive.current) setPromoted(current => [...current, content])
+      await loadBoard(query)
+    })
+  }, [mutate, api, sessionId, loadBoard, query])
+
   const create = useCallback((title: string, status: TaskStatus) => {
     void mutate(async () => {
       await api.call('task.create', { sessionId, task: { title, status } })
@@ -304,6 +329,9 @@ export function TasksView({ api, useTaskSettings, sessionId, t }: TasksViewProps
       detailLoading={detailLoading}
       jobs={jobs}
       jobOutput={jobOutput}
+      todos={todos}
+      promoted={promoted}
+      onPromote={promote}
       canDispatch={canDispatch}
       canDelete={canDelete}
       onRefresh={() => { void refresh() }}

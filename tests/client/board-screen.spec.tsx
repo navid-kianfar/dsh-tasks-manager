@@ -82,6 +82,9 @@ function render(over: Partial<BoardScreenProps> = {}): { container: HTMLElement;
     detailLoading: false,
     jobs: [],
     jobOutput: {},
+    todos: undefined,
+    promoted: [],
+    onPromote: vi.fn(),
     canDispatch: false,
     canDelete: true,
     onRefresh: vi.fn(),
@@ -210,6 +213,57 @@ describe('BoardScreen', () => {
     expect(container.textContent).toContain('pnpm test')
     expect(container.textContent).toContain('jobs.status.running')
     expect(container.textContent).toContain('jobs.kill')
+  })
+
+  it('shows the session checklist beside the board, and says when there is none', () => {
+    const absent = render({ view: view([task({ ref: 1 })]) })
+    act(() => {
+      [...absent.container.querySelectorAll('button')].find(n => n.textContent === 'board.session')?.click()
+    })
+    expect(absent.container.textContent).toContain('session.unavailable')
+
+    const present = render({
+      view: view([task({ ref: 1 })]),
+      todos: [
+        { content: 'read the failing test', status: 'completed' },
+        { content: 'fix the fold', status: 'in_progress' },
+      ],
+    })
+    act(() => {
+      [...present.container.querySelectorAll('button')].find(n => n.textContent === 'board.session')?.click()
+    })
+    expect(present.container.textContent).toContain('read the failing test')
+    expect(present.container.textContent).toContain('fix the fold')
+    expect(present.container.textContent).toContain('session.progress')
+  })
+
+  it('promotes a checklist step onto the board', () => {
+    const onPromote = vi.fn()
+    const { container } = render({
+      view: view([task({ ref: 1 })]),
+      todos: [{ content: 'fix the fold', status: 'pending' }],
+      onPromote,
+    })
+    act(() => {
+      [...container.querySelectorAll('button')].find(n => n.textContent === 'board.session')?.click()
+    })
+    act(() => {
+      [...container.querySelectorAll('button')].find(n => n.textContent?.includes('session.promote'))?.click()
+    })
+    expect(onPromote).toHaveBeenCalledWith('fix the fold')
+  })
+
+  it('marks a step already on the board instead of offering it twice', () => {
+    const { container } = render({
+      view: view([task({ ref: 1 })]),
+      todos: [{ content: 'fix the fold', status: 'pending' }],
+      promoted: ['fix the fold'],
+    })
+    act(() => {
+      [...container.querySelectorAll('button')].find(n => n.textContent === 'board.session')?.click()
+    })
+    expect(container.textContent).toContain('session.promoted')
+    expect([...container.querySelectorAll('button')].some(n => n.textContent?.includes('session.promote"'))).toBe(false)
   })
 
   it('offers dispatch only where the deployment can run it', () => {

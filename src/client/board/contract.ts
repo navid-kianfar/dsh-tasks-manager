@@ -19,6 +19,7 @@ import type {
   TaskStatus,
 } from '../../domain/types.ts'
 import type { JobView } from '../../host/protocol.ts'
+import type { SessionTodo } from './session-todo.ts'
 import type { TasksKey } from '../locales.ts'
 
 /**
@@ -30,7 +31,7 @@ import type { TasksKey } from '../locales.ts'
 export type BoardTranslate = (key: TasksKey, params?: Record<string, unknown>) => string
 
 /** Which layout the board is showing. */
-export type BoardMode = 'kanban' | 'list' | 'background'
+export type BoardMode = 'kanban' | 'list' | 'session' | 'background'
 
 /** A column heading a list view can sort by. */
 export type SortColumn = 'ref' | 'title' | 'status' | 'priority' | 'assignee' | 'dueAt' | 'updatedAt'
@@ -189,6 +190,18 @@ export interface TaskDetailProps {
   t: BoardTranslate
 }
 
+/** This session's checklist, shown beside the durable board. */
+export interface SessionTodosProps {
+  /** The session's todo list, or `undefined` when no todo capability is composed. */
+  todos: readonly SessionTodo[] | undefined
+  /** Copy a checklist step onto the project board. */
+  onPromote: (content: string) => void
+  /** Steps already copied to the board in this view's lifetime. */
+  promoted: readonly string[]
+  /** Translate. */
+  t: BoardTranslate
+}
+
 /** The background-jobs panel. */
 export interface BackgroundProps {
   /** Every job visible to this session. */
@@ -221,6 +234,12 @@ export interface BoardScreenProps {
   detail: TaskDetail | null
   /** Whether the open card's detail is loading. */
   detailLoading: boolean
+  /** This session's checklist, or `undefined` when no todo capability is composed. */
+  todos: readonly SessionTodo[] | undefined
+  /** Checklist steps already copied onto the board. */
+  promoted: readonly string[]
+  /** Copy a checklist step onto the board. */
+  onPromote: (content: string) => void
   /** Background jobs visible to this session. */
   jobs: readonly JobView[]
   /** Job output already read, by job id. */

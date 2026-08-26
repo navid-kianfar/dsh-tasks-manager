@@ -10,6 +10,8 @@ sqlite3 .dsh/tasks.db "select * from board"
 
 ## What it adds
 
+**A Session panel** showing this session's checklist — the one the assistant keeps with `todo_write` — beside the durable board. That pairing is the point: the checklist is scratch, cleared at the next turn and gone when the session ends, while the board is the project's. One click promotes a step you did not finish onto the board, where it stays.
+
 **A Tasks view** beside Chat and Trajectory, taking the whole centre column. Five columns (`backlog`, `todo`, `in progress`, `blocked`, `done`) with drag-and-drop between and within them, a dense sortable list view, filters over status, priority, labels, assignee and full-text search, and a card detail with an editable Markdown description, comments, and a complete history of every change.
 
 **Tools the model can reach**, so you can just say what you want:

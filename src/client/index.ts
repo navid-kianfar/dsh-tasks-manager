@@ -18,6 +18,8 @@ import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 // Type-only: pulls ui-settings' ctx.settingsScope merge.
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
+// Type-only: pulls tool-todo's `todos` projection key, read by the session checklist panel.
+import type {} from '@deepseek-ai/dsh-tool-todo/client'
 import type { Config } from '../host/index.ts'
 import { createTasksApi } from './rpc.ts'
 import { TasksView, type TasksViewInjected } from './TasksView.tsx'

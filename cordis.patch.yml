@@ -28,9 +28,10 @@
         # observe: the agent, another session, or `sqlite3` at a terminal. Only the revision counter
         # is polled at this rate; the cards are re-read solely when it moves.
         pollIntervalMs: 2000
-        # Dispatching a card to the agent needs a subagent provider by name, and no default can
-        # supply one — an unset value leaves the Dispatch action disabled and says why.
-        # Set it to a provider your profile composes, e.g. `spawn-in-process`.
+        # Dispatching a card to the agent needs a subagent provider BY NAME, and no default can
+        # supply one: naming a provider the composition does not mount would offer a Dispatch
+        # button that fails on click. Unset leaves the action hidden and the settings card says so.
+        # A standard dsh-base profile composes `spawn` and `fork`.
         subagentProvider: ''
         dispatchStatus: in_progress
         # Left at `none` deliberately: whether a finished run means the work is done is a judgement

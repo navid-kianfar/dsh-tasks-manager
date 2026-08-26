@@ -167,7 +167,7 @@ export function Toolbar({
         </span>
 
         <span className={css.segmented} role="group" aria-label={t('view.tasks')}>
-          {(['kanban', 'list', 'background'] as const).map((value: BoardMode) => (
+          {(['kanban', 'list', 'session', 'background'] as const).map((value: BoardMode) => (
             <button
               key={value}
               type="button"

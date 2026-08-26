@@ -13,6 +13,7 @@ import { Button, IconPlusOutline16 } from '@deepseek-ai/dsh-client-ui-primitives
 import type { TaskStatus } from '../../domain/types.ts'
 import type { BoardEmptyProps, BoardMode, BoardScreenProps, SortState } from './contract.ts'
 import { Background } from './Background.tsx'
+import { SessionTodos } from './SessionTodos.tsx'
 import { Kanban } from './Kanban.tsx'
 import { ListView } from './ListView.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
@@ -36,7 +37,8 @@ export function BoardEmpty({ filtered, onAction, t }: BoardEmptyProps) {
 /** Render the board screen. */
 export function BoardScreen({
   view, error, busy, query, onQueryChange, detail, detailLoading, jobs, jobOutput,
-  canDispatch, canDelete, onRefresh, onCreate, detailActions, taskActions, onJobRead, onJobKill, t,
+  todos, promoted, onPromote, canDispatch, canDelete, onRefresh, onCreate, detailActions,
+  taskActions, onJobRead, onJobKill, t,
 }: BoardScreenProps) {
   const [mode, setMode] = useState<BoardMode>('kanban')
   const [sort, setSort] = useState<SortState>({ column: 'updatedAt', direction: 'desc' })
@@ -119,18 +121,20 @@ export function BoardScreen({
       )}
 
       <div className={css.body}>
-        {mode === 'background'
-          ? (
-              <Background
-                jobs={jobs}
-                output={jobOutput}
-                onRead={onJobRead}
-                onKill={onJobKill}
-                onOpenTask={taskActions.onOpen}
-                t={t}
-              />
-            )
-          : view.tasks.length === 0
+        {mode === 'session'
+          ? <SessionTodos todos={todos} promoted={promoted} onPromote={onPromote} t={t} />
+          : mode === 'background'
+            ? (
+                <Background
+                  jobs={jobs}
+                  output={jobOutput}
+                  onRead={onJobRead}
+                  onKill={onJobKill}
+                  onOpenTask={taskActions.onOpen}
+                  t={t}
+                />
+              )
+            : view.tasks.length === 0
             ? (
                 <BoardEmpty
                   filtered={filtered}
