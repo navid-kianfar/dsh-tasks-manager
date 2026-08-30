@@ -21,8 +21,12 @@ import {
   MarkdownText,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { TASK_PRIORITIES, TASK_STATUSES, type TaskPriority, type TaskStatus } from '../../domain/types.ts'
-import type { TaskDetailProps } from './contract.ts'
+import type { BoardTranslate, TaskDetailProps } from './contract.ts'
 import { describeActivity, describeDue, relativeTime, toDateText } from './format.ts'
+import { AssigneePicker } from './AssigneePicker.tsx'
+import { DatePicker } from './DatePicker.tsx'
+import { Select, type SelectOption } from './Select.tsx'
+import { TagInput } from './TagInput.tsx'
 import css from './TaskDetail.module.css'
 
 /**
@@ -34,9 +38,31 @@ function isCommit(event: React.KeyboardEvent): boolean {
   return event.key === 'Enter' && (event.metaKey || event.ctrlKey)
 }
 
+/**
+ * The status options, in board order.
+ *
+ * Built per render rather than at module scope because every label goes through `t`, and the board
+ * must follow a locale switch without a reload.
+ * @param t - translate.
+ * @returns the options the status select offers.
+ */
+function statusChoices(t: BoardTranslate): SelectOption<TaskStatus>[] {
+  return TASK_STATUSES.map(status => ({ value: status, label: t(`status.${status}`), status }))
+}
+
+/**
+ * The priority options, ascending in urgency.
+ * @param t - translate.
+ * @returns the options the priority select offers.
+ */
+function priorityChoices(t: BoardTranslate): SelectOption<TaskPriority>[] {
+  return TASK_PRIORITIES.map(priority => ({ value: priority, label: t(`priority.${priority}`), priority }))
+}
+
 /** Render the card detail panel. */
 export function TaskDetail({
-  detail, loading, canDispatch, canDelete, onClose, onTitleChange, onBodyChange, onStatusChange,
+  detail, loading, canDispatch, canDelete, assignees, assigneesAvailable, knownLabels,
+  onClose, onTitleChange, onBodyChange, onStatusChange,
   onPriorityChange, onLabelsChange, onAssigneeChange, onDueChange, onArchive, onDelete, onDispatch,
   onStopRun, onComment, onCommentEdit, onCommentDelete, t,
 }: TaskDetailProps) {
@@ -84,6 +110,8 @@ export function TaskDetail({
 
   const due = describeDue(task.dueAt, Date.now(), t)
   const running = task.runningJobId !== undefined
+  const statusOptions = statusChoices(t)
+  const priorityOptions = priorityChoices(t)
 
   return (
     <aside className={css.panel} ref={panel} aria-label={`#${task.ref} ${task.title}`}>
@@ -122,60 +150,52 @@ export function TaskDetail({
           <div className={css.field}>
             <dt className={css.label}>{t('detail.status')}</dt>
             <dd className={css.value}>
-              <select
-                className={css.select}
+              <Select
                 value={task.status}
-                aria-label={t('detail.status')}
-                onChange={(event) => { onStatusChange(task.id, event.currentTarget.value as TaskStatus) }}
-              >
-                {TASK_STATUSES.map(status => (
-                  <option key={status} value={status}>{t(`status.${status}`)}</option>
-                ))}
-              </select>
+                options={statusOptions}
+                label={t('detail.status')}
+                onChange={(status: TaskStatus) => { onStatusChange(task.id, status) }}
+              />
             </dd>
           </div>
           <div className={css.field}>
             <dt className={css.label}>{t('detail.priority')}</dt>
             <dd className={css.value}>
-              <select
-                className={css.select}
+              <Select
                 value={task.priority}
-                aria-label={t('detail.priority')}
-                onChange={(event) => { onPriorityChange(task.id, event.currentTarget.value as TaskPriority) }}
-              >
-                {TASK_PRIORITIES.map(priority => (
-                  <option key={priority} value={priority}>{t(`priority.${priority}`)}</option>
-                ))}
-              </select>
+                options={priorityOptions}
+                label={t('detail.priority')}
+                onChange={(priority: TaskPriority) => { onPriorityChange(task.id, priority) }}
+              />
             </dd>
           </div>
           <div className={css.field}>
             <dt className={css.label}>{t('detail.assignee')}</dt>
             <dd className={css.value}>
-              <input
-                className={css.input}
-                key={`${task.id}:assignee:${task.assignee ?? ''}`}
-                defaultValue={task.assignee ?? ''}
-                placeholder={t('detail.assigneePlaceholder')}
-                aria-label={t('detail.assignee')}
-                onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
-                onBlur={(event) => {
-                  const next = event.currentTarget.value.trim()
-                  if (next !== (task.assignee ?? '')) onAssigneeChange(task.id, next)
-                }}
+              <AssigneePicker
+                key={`${task.id}:assignee`}
+                value={task.assignee}
+                authors={assignees}
+                available={assigneesAvailable}
+                label={t('detail.assignee')}
+                onChange={(assignee) => { onAssigneeChange(task.id, assignee) }}
+                t={t}
               />
             </dd>
           </div>
           <div className={css.field}>
             <dt className={css.label}>{t('detail.due')}</dt>
-            <dd className={css.value}>
-              <input
-                className={clsx(css.input, css.date)}
-                type="date"
-                key={`${task.id}:due:${task.dueAt ?? ''}`}
-                defaultValue={task.dueAt === undefined ? '' : toDateText(task.dueAt)}
-                aria-label={t('detail.due')}
-                onChange={(event) => { onDueChange(task.id, event.currentTarget.value) }}
+            {/* The urgency sits under the field rather than beside it: at half the panel's width
+                there is no room for both, and the tone is the part worth reading first. */}
+            <dd className={clsx(css.value, css.stacked)}>
+              <DatePicker
+                key={`${task.id}:due`}
+                value={task.dueAt === undefined ? undefined : toDateText(task.dueAt)}
+                label={t('detail.due')}
+                placeholder={t('detail.duePlaceholder')}
+                {...due === undefined ? {} : { tone: due.tone }}
+                onChange={(date) => { onDueChange(task.id, date) }}
+                t={t}
               />
               {due !== undefined && due.tone !== 'none' && (
                 <span className={css.dueTone} data-tone={due.tone}>{due.text}</span>
@@ -185,20 +205,14 @@ export function TaskDetail({
           <div className={clsx(css.field, css.wide)}>
             <dt className={css.label}>{t('detail.labels')}</dt>
             <dd className={css.value}>
-              <input
-                className={css.input}
-                key={`${task.id}:labels:${task.labels.join(',')}`}
-                defaultValue={task.labels.join(', ')}
+              <TagInput
+                key={`${task.id}:labels`}
+                value={task.labels}
+                suggestions={knownLabels}
+                label={t('detail.labels')}
                 placeholder={t('detail.labelsPlaceholder')}
-                aria-label={t('detail.labels')}
-                onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur() }}
-                onBlur={(event) => {
-                  const next = event.currentTarget.value
-                    .split(',')
-                    .map(entry => entry.trim())
-                    .filter(entry => entry !== '')
-                  if (next.join(',') !== task.labels.join(',')) onLabelsChange(task.id, next)
-                }}
+                onChange={(labels) => { onLabelsChange(task.id, labels) }}
+                t={t}
               />
             </dd>
           </div>

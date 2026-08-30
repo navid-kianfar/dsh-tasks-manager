@@ -39,7 +39,7 @@
   gap: 8px;
   padding: 8px 16px;
   border-bottom: 1px solid var(--dsw-alias-border-l2);
-  background: var(--dsw-alias-bg-layer-3);
+  background: var(--dsw-alias-bg-layer-2);
 }
 
 .composerIcon {
@@ -59,7 +59,7 @@
 }
 
 .composerInput::placeholder {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsh-tasks-field-placeholder);
 }
 
 .composerHint {

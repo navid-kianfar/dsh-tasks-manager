@@ -87,12 +87,15 @@ function render(over: Partial<BoardScreenProps> = {}): { container: HTMLElement;
     onPromote: vi.fn(),
     canDispatch: false,
     canDelete: true,
+    assignees: [],
+    assigneesAvailable: false,
     onRefresh: vi.fn(),
     onCreate,
     onJobRead: vi.fn(),
     onJobKill: vi.fn(),
     taskActions: {
       onOpen: vi.fn(), onMove: vi.fn(), onArchive: vi.fn(), onDelete: vi.fn(), onDispatch: vi.fn(),
+      onStopRun: vi.fn(),
     },
     detailActions: {
       onClose: vi.fn(), onTitleChange: vi.fn(), onBodyChange: vi.fn(), onStatusChange: vi.fn(),
@@ -264,6 +267,28 @@ describe('BoardScreen', () => {
     })
     expect(container.textContent).toContain('session.promoted')
     expect([...container.querySelectorAll('button')].some(n => n.textContent?.includes('session.promote"'))).toBe(false)
+  })
+
+  it('offers a stop control on a card the agent is working', () => {
+    const onStopRun = vi.fn()
+    const { container } = render({
+      view: view([task({ ref: 1, runningJobId: 'task-3' })]),
+      taskActions: {
+        onOpen: vi.fn(), onMove: vi.fn(), onArchive: vi.fn(), onDelete: vi.fn(), onDispatch: vi.fn(), onStopRun,
+      },
+    })
+    const stop = [...container.querySelectorAll('button')]
+      .find(node => node.getAttribute('aria-label') === 'card.stopRun')
+    expect(stop).not.toBeUndefined()
+
+    act(() => { stop?.click() })
+    expect(onStopRun).toHaveBeenCalledWith('task-3')
+  })
+
+  it('leaves an idle card without a stop control', () => {
+    const { container } = render({ view: view([task({ ref: 1 })]) })
+    expect([...container.querySelectorAll('button')]
+      .some(node => node.getAttribute('aria-label') === 'card.stopRun')).toBe(false)
   })
 
   it('offers dispatch only where the deployment can run it', () => {

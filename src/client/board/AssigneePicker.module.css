@@ -1,0 +1,106 @@
+/* The assignee field: an avatar on the trigger, and a searchable roster in the popover. */
+
+.popover {
+  width: 280px;
+  max-width: 90vw;
+}
+
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  font: 500 9px/12px var(--dsw-font-family);
+  letter-spacing: 0.02em;
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-module-platform);
+  border: 1px solid var(--dsw-alias-border-l2);
+}
+
+.avatarEmpty {
+  color: var(--dsw-alias-label-caption);
+}
+
+.searchSeat {
+  position: relative;
+  display: flex;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.searchIcon {
+  position: absolute;
+  left: 8px;
+  color: var(--dsw-alias-label-tertiary);
+  pointer-events: none;
+}
+
+.search {
+  width: 100%;
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 8px 0 28px;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsh-tasks-field-bg);
+  border: 1px solid var(--dsh-tasks-field-border);
+  border-radius: 8px;
+  outline: none;
+}
+
+.search:focus {
+  border-color: var(--dsh-tasks-field-ring);
+}
+
+.search::placeholder {
+  color: var(--dsh-tasks-field-placeholder);
+}
+
+.list {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  max-height: 260px;
+}
+
+.row {
+  gap: 8px;
+}
+
+/* Name over email, so a roster with two people called Alex is still readable. */
+.identity {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.you {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  border-radius: 999px;
+  font: 500 10px/14px var(--dsw-font-family);
+  color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-state-business-tertiary);
+}
+
+.email {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font: 11px/16px var(--dsw-font-family);
+  color: var(--dsw-alias-label-caption);
+}

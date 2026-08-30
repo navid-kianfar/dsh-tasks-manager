@@ -9,6 +9,7 @@
  */
 
 import { useEffect, useRef, useState } from 'react'
+import clsx from 'clsx'
 import { Button, IconPlusOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { TaskStatus } from '../../domain/types.ts'
 import type { BoardEmptyProps, BoardMode, BoardScreenProps, SortState } from './contract.ts'
@@ -19,6 +20,7 @@ import { ListView } from './ListView.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
 import { Toolbar } from './Toolbar.tsx'
 import { activeFilterCount, collectLabels } from './format.ts'
+import fields from './fields.module.css'
 import css from './BoardScreen.module.css'
 
 /** The zero state, in its two distinct forms. */
@@ -37,8 +39,8 @@ export function BoardEmpty({ filtered, onAction, t }: BoardEmptyProps) {
 /** Render the board screen. */
 export function BoardScreen({
   view, error, busy, query, onQueryChange, detail, detailLoading, jobs, jobOutput,
-  todos, promoted, onPromote, canDispatch, canDelete, onRefresh, onCreate, detailActions,
-  taskActions, onJobRead, onJobKill, t,
+  todos, promoted, onPromote, canDispatch, canDelete, assignees, assigneesAvailable,
+  onRefresh, onCreate, detailActions, taskActions, onJobRead, onJobKill, t,
 }: BoardScreenProps) {
   const [mode, setMode] = useState<BoardMode>('kanban')
   const [sort, setSort] = useState<SortState>({ column: 'updatedAt', direction: 'desc' })
@@ -51,7 +53,7 @@ export function BoardScreen({
 
   if (error !== null) {
     return (
-      <div className={css.screen}>
+      <div className={clsx(css.screen, fields.fields)}>
         <div className={css.failure} role="alert">
           <h3 className={css.emptyTitle}>{t('board.unavailable')}</h3>
           <p className={css.emptyBody}>{error}</p>
@@ -63,7 +65,7 @@ export function BoardScreen({
 
   if (view === null) {
     return (
-      <div className={css.screen} aria-busy="true">
+      <div className={clsx(css.screen, fields.fields)} aria-busy="true">
         <div className={css.skeletons}>
           {[0, 1, 2, 3, 4].map(index => <div key={index} className={css.skeletonColumn} />)}
         </div>
@@ -75,9 +77,10 @@ export function BoardScreen({
   const total = Object.values(view.counts).reduce((sum, count) => sum + count, 0)
   const filtered = activeFilterCount(query) > 0
   const running = jobs.filter(job => job.status === 'running' || job.status === 'stopping').length
+  const knownLabels = collectLabels(view.tasks)
 
   return (
-    <div className={css.screen}>
+    <div className={clsx(css.screen, fields.fields)}>
       <Toolbar
         query={query}
         onQueryChange={onQueryChange}
@@ -88,7 +91,7 @@ export function BoardScreen({
         shown={view.tasks.length}
         total={total}
         runningJobs={running}
-        knownLabels={collectLabels(view.tasks)}
+        knownLabels={knownLabels}
         onNewTask={() => { setComposing(true) }}
         onRefresh={onRefresh}
         busy={busy}
@@ -174,6 +177,9 @@ export function BoardScreen({
             loading={detailLoading}
             canDispatch={canDispatch}
             canDelete={canDelete}
+            assignees={assignees}
+            assigneesAvailable={assigneesAvailable}
+            knownLabels={knownLabels}
             {...detailActions}
             t={t}
           />

@@ -87,6 +87,37 @@ export function Menu({ open, anchor, items, onSelect }: {
 }
 
 /**
+ * The dialog's contents when it is open, flat — enough for a test to read the copy and press a
+ * button. The real component portals; keeping the tree in place is what lets an assertion query
+ * from the mounted container.
+ * @param props - the real component's props.
+ * @returns the dialog, or nothing while closed.
+ */
+export function Modal({ open, onClose, title, closeLabel = 'Close', description, children, footer }: {
+  open: boolean
+  onClose: () => void
+  title: string
+  closeLabel?: string
+  description?: string
+  children?: ReactNode
+  footer?: ReactNode
+  className?: string
+  contentClassName?: string
+  headless?: boolean
+}) {
+  if (!open) return null
+  return (
+    <div role="dialog" aria-label={title}>
+      <h2>{title}</h2>
+      <button type="button" aria-label={closeLabel} onClick={onClose} />
+      {description !== undefined && <p>{description}</p>}
+      {children}
+      {footer}
+    </div>
+  )
+}
+
+/**
  * Markdown rendered as its source text, which is what an assertion reads anyway.
  * @param props - the real component's props.
  * @returns the text in a block.
@@ -112,6 +143,8 @@ function icon(name: string) {
 export const IconArchiveOutline20 = icon('archive')
 export const IconCheckOutline14 = icon('check')
 export const IconChevronDownOutline14 = icon('chevron-down')
+export const IconChevronLeftOutline14 = icon('chevron-left')
+export const IconChevronRightOutline14 = icon('chevron-right')
 export const IconChevronUpOutline14 = icon('chevron-up')
 export const IconCloseFill14 = icon('close-fill')
 export const IconCloseOutline16 = icon('close')
@@ -124,3 +157,4 @@ export const IconRightUpOutline16 = icon('right-up')
 export const IconSearchOutline16 = icon('search')
 export const IconStopFill16 = icon('stop')
 export const IconTrashOutline16 = icon('trash')
+export const IconWarningOutline16 = icon('warning')

@@ -1,0 +1,10 @@
+/* The portalled surface's own positioning. Shape and colour come from fields.module.css; this file
+   owns only where the element sits and how tall it may be. */
+
+.surface {
+  position: fixed;
+  /* Above the design system's own modal layer (1000): a picker opened from inside a dialog still
+     belongs on top of it. Matches the shell's portalled menus. */
+  z-index: 1100;
+  overflow: hidden;
+}

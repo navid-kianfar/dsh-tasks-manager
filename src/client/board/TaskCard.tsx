@@ -15,6 +15,7 @@ import {
   IconEllipsisOutline16,
   IconLoadingOutline16,
   IconPlayOutline16,
+  IconStopFill16,
   IconTrashOutline16,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { Menu, type MenuEntry } from '@deepseek-ai/dsh-client-ui-primitives'
@@ -29,7 +30,7 @@ import css from './TaskCard.module.css'
  */
 export function TaskCard({
   task, selected, canDispatch, canDelete, dragging, onOpen, onArchive, onDelete, onDispatch,
-  onDragStart, onDragEnd, t,
+  onStopRun, onDragStart, onDragEnd, t,
 }: TaskCardProps) {
   const [menuOpen, setMenuOpen] = useState(false)
   const due = describeDue(task.dueAt, Date.now(), t)
@@ -39,6 +40,11 @@ export function TaskCard({
     { id: 'open', label: t('card.open') },
     ...canDispatch && !running && !task.archived
       ? [{ id: 'dispatch', label: t('card.dispatch'), icon: <IconPlayOutline16 size={14} /> }]
+      : [],
+    // A run started from a card must be stoppable from that card: the detail panel is one click
+    // further away, and a card that can only be started from here reads as a one-way door.
+    ...running
+      ? [{ id: 'stop', label: t('card.stopRun'), icon: <IconStopFill16 size={14} /> }]
       : [],
     { type: 'separator', id: 'sep' },
     task.archived
@@ -57,6 +63,7 @@ export function TaskCard({
     setMenuOpen(false)
     if (id === 'open') onOpen(task.id)
     else if (id === 'dispatch') onDispatch(task.id)
+    else if (id === 'stop' && task.runningJobId !== undefined) onStopRun(task.runningJobId)
     else if (id === 'archive') onArchive(task.id, true)
     else if (id === 'restore') onArchive(task.id, false)
     else if (id === 'delete') onDelete(task.id)
@@ -110,6 +117,19 @@ export function TaskCard({
         </span>
       </button>
       <span className={css.menuSeat}>
+        {running && (
+          // A sibling of the card's body, not a child: the body is itself a button, and the run
+          // must be stoppable without first opening the card.
+          <button
+            type="button"
+            className={css.stopButton}
+            aria-label={t('card.stopRun')}
+            title={t('card.stopRun')}
+            onClick={() => { onStopRun(task.runningJobId as string) }}
+          >
+            <IconStopFill16 size={12} />
+          </button>
+        )}
         <Menu
           open={menuOpen}
           portal

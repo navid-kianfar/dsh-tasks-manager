@@ -16,7 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { BoardView, TaskDetail as TaskDetailData, TaskPatch, TaskPlacement, TaskPriority, TaskQuery, TaskStatus } from '../domain/types.ts'
 import { TASK_STATUSES } from '../domain/types.ts'
-import type { JobView } from '../host/protocol.ts'
+import type { GitAuthor, JobView } from '../host/protocol.ts'
 import type { SettingsScope, SettingsScopeSnapshot } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls tool-todo's `todos` SessionProjectionMap merge so `useProjection('todos')` types.
 import type {} from '@deepseek-ai/dsh-tool-todo/client'
@@ -25,6 +25,7 @@ import type { Config } from '../host/index.ts'
 import type { TasksApi } from './rpc.ts'
 import { TasksApiError } from './rpc.ts'
 import { BoardScreen } from './board/BoardScreen.tsx'
+import { ConfirmDialog, type ConfirmRequest } from './board/ConfirmDialog.tsx'
 import type { BoardTranslate } from './board/contract.ts'
 
 /** What the slot registration injects into this view. */
@@ -101,6 +102,10 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
   const [detailLoading, setDetailLoading] = useState(false)
   const [jobs, setJobs] = useState<readonly JobView[]>([])
   const [jobOutput, setJobOutput] = useState<Record<string, string>>({})
+  const [assignees, setAssignees] = useState<{ authors: readonly GitAuthor[]; available: boolean }>(
+    { authors: [], available: false },
+  )
+  const [confirming, setConfirming] = useState<ConfirmRequest | null>(null)
 
   const revision = useRef(-1)
   const alive = useRef(true)
@@ -142,6 +147,19 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     }
   }, [api, sessionId])
 
+  // Read once per mount and again on an explicit refresh, not on the poll: a project's committers
+  // change at the speed of `git commit`, and the host caches the answer for a minute anyway.
+  const loadAssignees = useCallback(async (): Promise<void> => {
+    try {
+      const result = await api.call('git.authors', { sessionId })
+      if (alive.current) setAssignees({ authors: result.authors, available: result.available })
+    } catch {
+      // No git, no repository, or a host too old to answer: the picker says so, and the board is
+      // perfectly usable without an assignee.
+      if (alive.current) setAssignees({ authors: [], available: false })
+    }
+  }, [api, sessionId])
+
   const loadDetail = useCallback(async (taskId: string): Promise<void> => {
     setDetailLoading(true)
     try {
@@ -164,16 +182,18 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
       await Promise.all([
         loadBoard(query),
         loadJobs(),
+        loadAssignees(),
         ...openId === undefined ? [] : [loadDetail(openId)],
       ])
     } finally {
       if (alive.current) setBusy(false)
     }
-  }, [loadBoard, loadJobs, loadDetail, query, openId])
+  }, [loadBoard, loadJobs, loadAssignees, loadDetail, query, openId])
 
   // The filters are a host-side query, so changing them is a read, not a client-side filter.
   useEffect(() => { void loadBoard(query) }, [loadBoard, query])
   useEffect(() => { void loadJobs() }, [loadJobs])
+  useEffect(() => { void loadAssignees() }, [loadAssignees])
   useEffect(() => {
     if (openId === undefined) { setDetail(null); return }
     void loadDetail(openId)
@@ -277,11 +297,17 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
 
   const remove = useCallback((taskId: string) => {
     const target = view?.tasks.find(entry => entry.id === taskId)
-    if (target !== undefined && !globalThis.confirm(t('confirm.delete', { ref: target.ref }))) return
-    void mutate(async () => {
-      await api.call('task.delete', { sessionId, taskId })
-      if (openId === taskId) setOpenId(undefined)
-      await loadBoard(query)
+    setConfirming({
+      title: t('confirm.deleteTitle', { ref: target?.ref ?? '' }),
+      description: t('confirm.delete'),
+      confirmLabel: t('confirm.deleteAction'),
+      onConfirm: () => {
+        void mutate(async () => {
+          await api.call('task.delete', { sessionId, taskId })
+          if (openId === taskId) setOpenId(undefined)
+          await loadBoard(query)
+        })
+      },
     })
   }, [view, t, mutate, api, sessionId, openId, loadBoard, query])
 
@@ -319,64 +345,81 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
   }, [mutate, api, sessionId, loadJobs])
 
   return (
-    <BoardScreen
-      view={view}
-      error={error}
-      busy={busy}
-      query={query}
-      onQueryChange={setQuery}
-      detail={detail}
-      detailLoading={detailLoading}
-      jobs={jobs}
-      jobOutput={jobOutput}
-      todos={todos}
-      promoted={promoted}
-      onPromote={promote}
-      canDispatch={canDispatch}
-      canDelete={canDelete}
-      onRefresh={() => { void refresh() }}
-      onCreate={create}
-      onJobRead={jobRead}
-      onJobKill={jobKill}
-      taskActions={{
-        onOpen: setOpenId,
-        onMove: move,
-        onArchive: archive,
-        onDelete: remove,
-        onDispatch: dispatch,
-      }}
-      detailActions={{
-        onClose: () => { setOpenId(undefined) },
-        onTitleChange: (taskId, title) => { patch(taskId, { title }) },
-        onBodyChange: (taskId, body) => { patch(taskId, { body: body.trim() === '' ? null : body }) },
-        onStatusChange: (taskId, status) => { patch(taskId, { status }) },
-        onPriorityChange: (taskId, priority: TaskPriority) => { patch(taskId, { priority }) },
-        onLabelsChange: (taskId, labels) => { patch(taskId, { labels: labels.length === 0 ? null : labels }) },
-        onAssigneeChange: (taskId, assignee) => { patch(taskId, { assignee: assignee === '' ? null : assignee }) },
-        onDueChange: (taskId, date) => {
-          const at = date === '' ? null : Date.parse(`${date}T00:00:00.000Z`)
-          patch(taskId, { dueAt: at === null || Number.isNaN(at) ? null : at })
-        },
-        onArchive: archive,
-        onDelete: remove,
-        onDispatch: dispatch,
-        onStopRun: jobKill,
-        onComment: comment,
-        onCommentEdit: (commentId, body) => {
-          void mutate(async () => {
-            await api.call('comment.edit', { sessionId, commentId, body })
-            if (openId !== undefined) await loadDetail(openId)
-          })
-        },
-        onCommentDelete: (commentId) => {
-          if (!globalThis.confirm(t('confirm.deleteComment'))) return
-          void mutate(async () => {
-            await api.call('comment.remove', { sessionId, commentId })
-            if (openId !== undefined) await loadDetail(openId)
-          })
-        },
-      }}
-      t={t}
-    />
+    <>
+      <BoardScreen
+        view={view}
+        error={error}
+        busy={busy}
+        query={query}
+        onQueryChange={setQuery}
+        detail={detail}
+        detailLoading={detailLoading}
+        jobs={jobs}
+        jobOutput={jobOutput}
+        todos={todos}
+        promoted={promoted}
+        onPromote={promote}
+        canDispatch={canDispatch}
+        canDelete={canDelete}
+        assignees={assignees.authors}
+        assigneesAvailable={assignees.available}
+        onRefresh={() => { void refresh() }}
+        onCreate={create}
+        onJobRead={jobRead}
+        onJobKill={jobKill}
+        taskActions={{
+          onOpen: setOpenId,
+          onMove: move,
+          onArchive: archive,
+          onDelete: remove,
+          onDispatch: dispatch,
+          onStopRun: jobKill,
+        }}
+        detailActions={{
+          onClose: () => { setOpenId(undefined) },
+          onTitleChange: (taskId, title) => { patch(taskId, { title }) },
+          onBodyChange: (taskId, body) => { patch(taskId, { body: body.trim() === '' ? null : body }) },
+          onStatusChange: (taskId, status) => { patch(taskId, { status }) },
+          onPriorityChange: (taskId, priority: TaskPriority) => { patch(taskId, { priority }) },
+          onLabelsChange: (taskId, labels) => { patch(taskId, { labels: labels.length === 0 ? null : labels }) },
+          onAssigneeChange: (taskId, assignee) => { patch(taskId, { assignee: assignee === '' ? null : assignee }) },
+          onDueChange: (taskId, date) => {
+            const at = date === '' ? null : Date.parse(`${date}T00:00:00.000Z`)
+            patch(taskId, { dueAt: at === null || Number.isNaN(at) ? null : at })
+          },
+          onArchive: archive,
+          onDelete: remove,
+          onDispatch: dispatch,
+          onStopRun: jobKill,
+          onComment: comment,
+          onCommentEdit: (commentId, body) => {
+            void mutate(async () => {
+              await api.call('comment.edit', { sessionId, commentId, body })
+              if (openId !== undefined) await loadDetail(openId)
+            })
+          },
+          onCommentDelete: (commentId) => {
+            setConfirming({
+              title: t('confirm.deleteCommentTitle'),
+              description: t('confirm.deleteComment'),
+              confirmLabel: t('confirm.deleteCommentAction'),
+              onConfirm: () => {
+                void mutate(async () => {
+                  await api.call('comment.remove', { sessionId, commentId })
+                  if (openId !== undefined) await loadDetail(openId)
+                })
+              },
+            })
+          },
+        }}
+        t={t}
+      />
+      <ConfirmDialog
+        request={confirming}
+        onClose={() => { setConfirming(null) }}
+        cancelLabel={t('confirm.cancel')}
+        closeLabel={t('confirm.close')}
+      />
+    </>
   )
 }

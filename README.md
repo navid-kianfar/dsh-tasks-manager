@@ -14,17 +14,21 @@ sqlite3 .dsh/tasks.db "select * from board"
 
 **A Tasks view** beside Chat and Trajectory, taking the whole centre column. Five columns (`backlog`, `todo`, `in progress`, `blocked`, `done`) with drag-and-drop between and within them, a dense sortable list view, filters over status, priority, labels, assignee and full-text search, and a card detail with an editable Markdown description, comments, and a complete history of every change.
 
+**Fields that know what they can hold.** Status and priority are pickers, the due date is a calendar, and labels are chips completed from the labels already on the board. The assignee is the one that matters most: it offers **the people who have committed to this project**, read from `git log` and ranked by how much of it each has written, with the identity `git config` names in the repository first. A board where `alex`, `Alex`, and `alex@…` are three different people is a board whose assignee filter is decorative. A value already on a card that is not in the history is kept and still selectable — the picker narrows what can be chosen, never what a card already says. In a directory that is not a repository, the picker says so.
+
 **Tools the model can reach**, so you can just say what you want:
 
 > *"add a task to rotate the staging API keys, urgent, label it security"*
 
 `task_add`, `task_list`, `task_update`, `task_comment`, and (off by default) `task_delete`. Cards are addressed the way a person quotes them — `#12`, `12`, or the full id. Every model write is attributed to `agent` in the history, so you can always see who changed what.
 
+**Assignees from the repository.** `git log` is read per project and cached for a minute, so the picker is right the moment someone's first commit lands and there is no roster to maintain. Nothing is written to git, and a project with no repository simply has no one to assign.
+
 **Archive and reopen** rather than delete: archiving hides a card from the board and keeps its comments and history intact. Deleting is a separate, confirmed action, and the model cannot do it unless you turn that on.
 
 **A Background panel** listing every background task the session can see — shell commands, subagents, and cards dispatched from the board — with live status, on-demand output, and a stop control.
 
-**Dispatch a card to the agent.** With a subagent provider configured, a card can be handed to the agent to work detached from your current turn: the card shows a live running state, the run appears in the Background panel and the harness's own job surfaces, and the outcome is recorded on the card.
+**Dispatch a card to the agent.** With a subagent provider configured, a card can be handed to the agent to work detached from your current turn: the card shows a live running state, the run appears in the Background panel and the harness's own job surfaces, and the outcome is recorded on the card. A running card carries its own stop control, on the card and in its menu as well as in the detail; and deleting a card stops the run working it first, so no subagent is left spending tokens on a task whose record has been thrown away.
 
 ## Install
 

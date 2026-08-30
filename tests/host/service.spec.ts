@@ -45,6 +45,67 @@ afterEach(() => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true })
 })
 
+/**
+ * A stand-in job registry, recording what was asked to stop.
+ *
+ * The real one lives in `@deepseek-ai/dsh-jobs`, which this package does not depend on: the service
+ * reaches it through `ctx.get('jobs')` precisely so a deployment without it still works, and that
+ * seam is what a test can stand in at.
+ */
+function jobRegistry(): { killed: string[]; kill: (jobId: string) => { outcome: string } } {
+  const killed: string[] = []
+  return {
+    killed,
+    kill: (jobId: string) => {
+      killed.push(jobId)
+      return { outcome: 'requested' }
+    },
+  }
+}
+
+describe('deleting a dispatched card', () => {
+  it('stops the run working it before the row goes', async () => {
+    const ctx = await mount()
+    const jobs = jobRegistry()
+    ctx.provide('jobs', jobs)
+    const board = ctx.tasks.boardForCwd(project())
+    const card = board.create({ title: 'dispatched' }, { actor: 'user' }, Date.now())
+    board.startRun(card.id, 'task-9', { actor: 'user' }, Date.now())
+
+    ctx.tasks.removeTask(board, card.id, 'session-1')
+
+    // The subagent is stopped, not left running against a task nobody can see any more.
+    expect(jobs.killed).toEqual(['task-9'])
+    expect(board.read().tasks).toEqual([])
+  })
+
+  it('deletes an idle card without troubling the registry', async () => {
+    const ctx = await mount()
+    const jobs = jobRegistry()
+    ctx.provide('jobs', jobs)
+    const board = ctx.tasks.boardForCwd(project())
+    const card = board.create({ title: 'idle' }, { actor: 'user' }, Date.now())
+
+    ctx.tasks.removeTask(board, card.id, 'session-1')
+
+    expect(jobs.killed).toEqual([])
+    expect(board.read().tasks).toEqual([])
+  })
+
+  it('still deletes the card when the run cannot be stopped', async () => {
+    const ctx = await mount()
+    // No job registry composed at all: the kill is impossible, and refusing the delete over it
+    // would be the wrong trade.
+    const board = ctx.tasks.boardForCwd(project())
+    const card = board.create({ title: 'orphan' }, { actor: 'user' }, Date.now())
+    board.startRun(card.id, 'task-9', { actor: 'user' }, Date.now())
+
+    ctx.tasks.removeTask(board, card.id, 'session-1')
+
+    expect(board.read().tasks).toEqual([])
+  })
+})
+
 describe('ctx.tasks', () => {
   it('serves a board through the service proxy', async () => {
     const ctx = await mount()

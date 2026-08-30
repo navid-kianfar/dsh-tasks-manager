@@ -1,4 +1,6 @@
-/* Card detail panel. Every colour is an alias token; none is a literal. */
+/* Card detail panel. Every colour is an alias token; none is a literal. Field surfaces, placeholder
+   text and popover shapes come from fields.module.css — see its header for why the placeholder is
+   the one token with a per-theme value. */
 
 .panel {
   position: absolute;
@@ -100,12 +102,16 @@
 }
 
 .title:hover {
-  border-color: var(--dsw-alias-border-l2);
+  border-color: var(--dsh-tasks-field-border);
 }
 
 .title:focus {
-  border-color: var(--dsw-alias-state-business-primary);
-  background: var(--dsw-alias-bg-layer-3);
+  border-color: var(--dsh-tasks-field-ring);
+  background: var(--dsh-tasks-field-bg);
+}
+
+.title::placeholder {
+  color: var(--dsh-tasks-field-placeholder);
 }
 
 .fields {
@@ -139,31 +145,12 @@
   min-width: 0;
 }
 
-.select,
-.input {
-  width: 100%;
-  box-sizing: border-box;
-  height: 28px;
-  padding: 0 8px;
-  font: 13px/20px var(--dsw-font-family);
-  color: var(--dsw-alias-label-primary);
-  background: var(--dsw-alias-bg-layer-3);
-  border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 8px;
-  outline: none;
-}
-
-.select:focus,
-.input:focus {
-  border-color: var(--dsw-alias-state-business-primary);
-}
-
-.input::placeholder {
-  color: var(--dsw-alias-label-dimmed);
-}
-
-.date {
-  font-variant-numeric: tabular-nums;
+/* The due field stacks its urgency under the picker, so `.value`'s row layout is overridden for
+   that one cell rather than for every field. */
+.stacked {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
 }
 
 .dueTone {
@@ -262,19 +249,23 @@
   padding: 8px 10px;
   font: 13px/20px var(--dsw-font-family);
   color: var(--dsw-alias-label-primary);
-  background: var(--dsw-alias-bg-layer-3);
-  border: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsh-tasks-field-bg);
+  border: 1px solid var(--dsh-tasks-field-border);
   border-radius: 8px;
   outline: none;
   resize: vertical;
 }
 
+.textarea:hover {
+  border-color: var(--dsh-tasks-field-border-strong);
+}
+
 .textarea:focus {
-  border-color: var(--dsw-alias-state-business-primary);
+  border-color: var(--dsh-tasks-field-ring);
 }
 
 .textarea::placeholder {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsh-tasks-field-placeholder);
 }
 
 .editorFoot {

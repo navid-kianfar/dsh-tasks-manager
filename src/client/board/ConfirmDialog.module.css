@@ -1,0 +1,24 @@
+/* The confirmation dialog's body. The card, mask and footer row are the design system's Modal. */
+
+.dialog {
+  width: min(420px, 100%);
+}
+
+.warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.warningIcon {
+  flex: 0 0 auto;
+  margin-top: 2px;
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.body {
+  margin: 0;
+  font: 14px/22px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  overflow-wrap: anywhere;
+}

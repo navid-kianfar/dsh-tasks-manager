@@ -1,0 +1,98 @@
+/* The labels field: a field-shaped seat holding chips and one growing entry box. */
+
+.seat {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 30px;
+  padding: 3px 6px;
+  background: var(--dsh-tasks-field-bg);
+  border: 1px solid var(--dsh-tasks-field-border);
+  border-radius: 8px;
+  cursor: text;
+}
+
+.seat:hover {
+  border-color: var(--dsh-tasks-field-border-strong);
+}
+
+/* The seat carries focus for the input inside it, so the whole field lights up rather than a
+   rectangle in the middle of it. */
+.seat:focus-within,
+.seatOpen {
+  border-color: var(--dsh-tasks-field-ring);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  max-width: 100%;
+  height: 20px;
+  padding: 0 2px 0 8px;
+  font: 500 11px/16px var(--dsw-font-family);
+  color: var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-bg-module-platform);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+}
+
+.chipText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chipRemove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  color: var(--dsw-alias-label-tertiary);
+  background: none;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.chipRemove:hover {
+  background: var(--dsw-alias-interactive-bg-hover-danger);
+  color: var(--dsw-alias-state-error-primary);
+}
+
+.chipRemove:focus-visible {
+  outline: 2px solid var(--dsh-tasks-field-ring);
+  outline-offset: -1px;
+}
+
+/* Grows to fill the row it lands on, so the caret is never squeezed against the last chip. */
+.entry {
+  flex: 1 1 60px;
+  min-width: 60px;
+  height: 22px;
+  padding: 0 2px;
+  font: 13px/20px var(--dsw-font-family);
+  color: var(--dsw-alias-label-primary);
+  background: none;
+  border: 0;
+  outline: none;
+}
+
+.entry::placeholder {
+  color: var(--dsh-tasks-field-placeholder);
+}
+
+.entry:disabled {
+  cursor: not-allowed;
+}
+
+.entry:disabled::placeholder {
+  color: var(--dsw-alias-label-caption);
+}

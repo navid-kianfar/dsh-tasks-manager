@@ -487,9 +487,11 @@ export function apply(ctx: Context, config: Config): void {
       }],
     },
     execute(args, exec) {
-      const { board } = boardOf(ctx, exec)
+      const { board, author } = boardOf(ctx, exec)
       const target = resolveTask(board, args.task)
-      board.remove(target.id)
+      // Through the service, not `board.remove`: a dispatched card owns a live subagent, and the
+      // deletion path is what stops it.
+      ctx.tasks.removeTask(board, target.id, author.sessionId ?? '')
       return Promise.resolve({ ref: target.ref, title: target.title, deleted: true })
     },
     presentCall: args => ({ card: 'generic', title: `Delete task ${args.task}`, kind: 'other', rawInput: args }),

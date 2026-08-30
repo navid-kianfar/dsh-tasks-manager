@@ -149,14 +149,14 @@
   padding: 8px 10px;
   font: 14px/20px var(--dsw-font-family);
   color: var(--dsw-alias-label-primary);
-  background: var(--dsw-alias-bg-layer-3);
-  border: 1px solid var(--dsw-alias-state-business-primary);
+  background: var(--dsh-tasks-field-bg);
+  border: 1px solid var(--dsh-tasks-field-ring);
   border-radius: 8px;
   outline: none;
 }
 
 .draft::placeholder {
-  color: var(--dsw-alias-label-dimmed);
+  color: var(--dsh-tasks-field-placeholder);
 }
 
 @media (prefers-reduced-motion: reduce) {

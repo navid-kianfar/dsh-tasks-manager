@@ -41,9 +41,11 @@ import { TaskValidationError, parseCommentIdText, parseTaskId } from '../domain/
 import { TaskNotFoundError, TaskStoreRegistry, type TaskAuthor, type TaskStore } from './store.ts'
 import { DEFAULT_DATABASE_PATH, JOURNAL_MODES, TaskStoreError, type JournalMode } from './db.ts'
 import { projectRootFor } from './project-root.ts'
+import { GitAuthorDirectory } from './git-authors.ts'
 import {
   TASKS_RPC_CHANNEL,
   type BoardRevisionResult,
+  type GitAuthorsResult,
   type JobKillResult,
   type JobReadResult,
   type JobView,
@@ -52,6 +54,8 @@ import {
 } from './protocol.ts'
 
 export type * from './protocol.ts'
+export type { GitAuthor, GitAuthorDirectoryResult } from './git-authors.ts'
+export { GitAuthorDirectory } from './git-authors.ts'
 export type { TaskAuthor, TaskStore } from './store.ts'
 export { TaskNotFoundError } from './store.ts'
 
@@ -166,6 +170,19 @@ function toRpcError(error: unknown): { ok: false; error: RpcError } {
   }
 }
 
+/**
+ * The persisted-session lookup this plugin borrows, declared structurally.
+ *
+ * `@deepseek-ai/dsh-session-persistence` is not a dependency of this package and should not become
+ * one: the board needs exactly one field off one call, and a deployment composing no persistence
+ * backend must still serve live sessions. `ctx.get` answers `undefined` there, and the widest thing
+ * this plugin ever touches is `cwd`.
+ */
+interface PersistedSessions {
+  /** Every materialized session's header, from metadata alone — no log is parsed. */
+  list(signal?: AbortSignal): Promise<readonly { id: string; cwd?: string | undefined }[]>
+}
+
 /** Raised when a request names a session this process cannot resolve a project for. */
 class SessionUnavailableError extends Error {
   /**
@@ -253,6 +270,21 @@ export class TasksService extends Service {
   private registry: TaskStoreRegistry
   /** Which card each live job is working, so the Background panel can link a job back to its card. */
   private readonly jobTasks = new Map<string, { taskId: string; projectRoot: string }>()
+  /**
+   * Who has committed to each project, cached across sessions sharing one.
+   *
+   * Lives on the service rather than in the endpoint so the forked `git log` is shared: two browsers
+   * open on the same project, or one opening card after card, cost one subprocess a minute.
+   */
+  private readonly gitAuthors = new GitAuthorDirectory()
+  /**
+   * Working directory per session id, including sessions no longer live.
+   *
+   * A session's `cwd` is fixed at creation, so an entry never goes stale. One `list()` fills the
+   * map for every session on disk at once, which is what keeps the board's two-second poll from
+   * re-reading persistence on every tick after a restart.
+   */
+  private readonly sessionCwd = new Map<string, string>()
 
   /**
    * @param ctx - host context.
@@ -344,10 +376,91 @@ export class TasksService extends Service {
     if (root === undefined) {
       throw new SessionUnavailableError(
         sessionId,
-        'this session has no working directory, so it belongs to no project board',
+        'this session names no working directory on this host, so it belongs to no project board',
       )
     }
     return this.registry.open(root, Date.now())
+  }
+
+  /**
+   * The working directory a session belongs to, live or not.
+   *
+   * A board outlives the session that opened it, and so does the tab pointing at one. Restart the
+   * harness with the Tasks view open on a finished run — a dispatched card's one-shot subagent, say
+   * — and the live store has never heard of that session, though its log is on disk and every other
+   * tab in the view is reading it. Resolving through persistence is what stops the board from being
+   * the one surface that says the session does not exist.
+   *
+   * The live store is consulted first regardless: it is the only source that is certainly current.
+   * @param sessionId - the session asking.
+   * @returns its working directory, or `undefined` when nothing on this host knows one.
+   */
+  private async cwdForSession(sessionId: string): Promise<string | undefined> {
+    // Both halves of this package share one compilation unit, so the `sessions` Context key
+    // carries the browser runtime's face here; the running node process holds the Host store.
+    const sessions = this.ctx.get('sessions') as unknown as SessionStore | undefined
+    const live = sessions?.get(sessionId as SessionId)
+    if (live !== undefined) return live.header.cwd
+
+    const cached = this.sessionCwd.get(sessionId)
+    if (cached !== undefined) return cached
+
+    const persistence = this.ctx.get('sessionPersistence') as PersistedSessions | undefined
+    if (persistence === undefined) return undefined
+    try {
+      // One listing answers for every session on disk, so the map is filled wholesale rather than
+      // one lookup at a time.
+      for (const header of await persistence.list()) {
+        if (typeof header.cwd === 'string') this.sessionCwd.set(header.id, header.cwd)
+      }
+    } catch (error) {
+      // A persistence backend that cannot list is a broken installation, not this request's fault;
+      // the caller's own "no project board" message says the actionable part.
+      this.ctx.logger?.debug?.('dsh-tasks: could not list persisted sessions: %o', error)
+      return undefined
+    }
+    return this.sessionCwd.get(sessionId)
+  }
+
+  /**
+   * The board belonging to a session's project, resolving sessions that are no longer live.
+   * @param sessionId - the session asking.
+   * @returns its project's board.
+   * @throws SessionUnavailableError when no directory can be found for the session.
+   */
+  async boardForSession(sessionId: string): Promise<TaskStore> {
+    return this.boardForCwd(await this.cwdForSession(sessionId), sessionId)
+  }
+
+  /**
+   * The project root a session belongs to.
+   *
+   * The same walk the board itself is keyed on, so anything read *about* the project — its commit
+   * history, for one — is read from the directory the board lives in rather than from wherever the
+   * session happened to be opened.
+   * @param sessionId - the session asking.
+   * @returns the project root.
+   * @throws SessionUnavailableError when no directory can be found for the session.
+   */
+  async projectRootForSession(sessionId: string): Promise<string> {
+    const root = projectRootFor(await this.cwdForSession(sessionId), this.config().projectRootMarkers)
+    if (root === undefined) {
+      throw new SessionUnavailableError(
+        sessionId,
+        'this session names no working directory on this host, so it belongs to no project board',
+      )
+    }
+    return root
+  }
+
+  /**
+   * Everyone who has committed to a session's project.
+   * @param sessionId - the session asking.
+   * @param now - epoch ms, for the cache's age check.
+   * @returns the committers, or an unavailable result when git could not be read.
+   */
+  async authorsFor(sessionId: string, now: number): Promise<GitAuthorsResult> {
+    return this.gitAuthors.read(await this.projectRootForSession(sessionId), now)
   }
 
   /**
@@ -396,31 +509,33 @@ export class TasksService extends Service {
     const author: TaskAuthor = { actor: 'user', sessionId }
     const now = Date.now()
 
+    // Every board endpoint resolves the session through persistence when it is not live, so a tab
+    // left open on a finished run still reads its project's board after a restart.
     switch (endpoint) {
       case 'board.read':
-        return this.boardFor(sessionId).read(optionalObject(payload, 'query'))
+        return (await this.boardForSession(sessionId)).read(optionalObject(payload, 'query'))
       case 'board.revision': {
-        const board = this.boardFor(sessionId)
+        const board = await this.boardForSession(sessionId)
         const { counts, archivedCount } = board.counts()
         return { revision: board.revision(), counts, archivedCount } satisfies BoardRevisionResult
       }
       case 'task.detail':
-        return this.boardFor(sessionId).detail(parseTaskId(requireString(payload, 'taskId')))
+        return (await this.boardForSession(sessionId)).detail(parseTaskId(requireString(payload, 'taskId')))
       case 'task.create':
-        return this.boardFor(sessionId).create(
+        return (await this.boardForSession(sessionId)).create(
           optionalObject(payload, 'task') as unknown as TaskCreate,
           author,
           now,
         )
       case 'task.update':
-        return this.boardFor(sessionId).update(
+        return (await this.boardForSession(sessionId)).update(
           parseTaskId(requireString(payload, 'taskId')),
           optionalObject(payload, 'patch') as unknown as TaskPatch,
           author,
           now,
         )
       case 'task.move':
-        return this.boardFor(sessionId).update(
+        return (await this.boardForSession(sessionId)).update(
           parseTaskId(requireString(payload, 'taskId')),
           {
             status: requireString(payload, 'status') as TaskStatus,
@@ -430,26 +545,28 @@ export class TasksService extends Service {
           now,
         )
       case 'task.archive':
-        return this.boardFor(sessionId).setArchived(
+        return (await this.boardForSession(sessionId)).setArchived(
           parseTaskId(requireString(payload, 'taskId')), true, author, now,
         )
       case 'task.restore':
-        return this.boardFor(sessionId).setArchived(
+        return (await this.boardForSession(sessionId)).setArchived(
           parseTaskId(requireString(payload, 'taskId')), false, author, now,
         )
       case 'task.delete':
-        this.boardFor(sessionId).remove(parseTaskId(requireString(payload, 'taskId')))
+        this.removeTask(await this.boardForSession(sessionId), parseTaskId(requireString(payload, 'taskId')), sessionId)
         return { deleted: true }
       case 'comment.add':
-        return this.boardFor(sessionId).addComment(
+        return (await this.boardForSession(sessionId)).addComment(
           parseTaskId(requireString(payload, 'taskId')), requireString(payload, 'body'), author, now,
         )
       case 'comment.edit':
-        return this.boardFor(sessionId).editComment(
+        return (await this.boardForSession(sessionId)).editComment(
           parseCommentIdText(requireString(payload, 'commentId')), requireString(payload, 'body'), now,
         )
       case 'comment.remove':
-        this.boardFor(sessionId).removeComment(parseCommentIdText(requireString(payload, 'commentId')), now)
+        (await this.boardForSession(sessionId)).removeComment(
+          parseCommentIdText(requireString(payload, 'commentId')), now,
+        )
         return { deleted: true }
       case 'task.dispatch':
         return this.dispatch(
@@ -464,6 +581,8 @@ export class TasksService extends Service {
         return this.readJob(sessionId, requireString(payload, 'jobId'))
       case 'jobs.kill':
         return this.killJob(sessionId, requireString(payload, 'jobId'))
+      case 'git.authors':
+        return this.authorsFor(sessionId, now)
       default:
         // The channel routes every path under its prefix here, so an unrecognised endpoint is a
         // client that has outrun this build — not an internal fault.
@@ -521,6 +640,36 @@ export class TasksService extends Service {
     const jobs = this.ctx.get('jobs')
     if (jobs === undefined) throw new TaskValidationError('no background job registry is composed')
     return { outcome: jobs.kill(jobId as never, this.agentFor(sessionId), 'stopped from the task board') }
+  }
+
+  /**
+   * Delete a card, stopping the run working it first.
+   *
+   * The one deletion path: the board UI and the model's `task_delete` both come through here, so
+   * neither can leave an orphaned subagent behind.
+   *
+   * A dispatched card owns a live subagent. Deleting the card without stopping it leaves that
+   * subagent running against a task nobody can see, reporting to a row that no longer exists —
+   * spending tokens on work whose record has been thrown away. The kill goes first because the
+   * settlement handler looks the card up: once the row is gone it has nothing to write to, and
+   * the job would otherwise settle into a board that has forgotten it.
+   * @param board - the board the card belongs to.
+   * @param taskId - the card to delete.
+   * @param sessionId - the session asking, for resolving its agent.
+   */
+  removeTask(board: TaskStore, taskId: string, sessionId: string): void {
+    const running = board.detail(taskId).task.runningJobId
+    if (running !== undefined) {
+      try {
+        this.killJob(sessionId, running)
+      } catch (error) {
+        // A job the registry has already forgotten, or no registry at all: the card still goes.
+        // Refusing the delete because its run could not be stopped would be the wrong trade.
+        this.ctx.logger?.debug?.('dsh-tasks: could not stop the run for a deleted card: %o', error)
+      }
+      this.jobTasks.delete(running)
+    }
+    board.remove(taskId)
   }
 
   /**

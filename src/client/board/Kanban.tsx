@@ -62,7 +62,8 @@ function neighbours(column: readonly Task[], beforeId: string | undefined): Task
 
 /** Render the kanban board. */
 export function Kanban({
-  tasks, counts, selectedId, canDispatch, canDelete, onQuickAdd, onOpen, onMove, onArchive, onDelete, onDispatch, t,
+  tasks, counts, selectedId, canDispatch, canDelete, onQuickAdd, onOpen, onMove, onArchive, onDelete,
+  onDispatch, onStopRun, t,
 }: KanbanProps) {
   // The drag is held in refs and MIRRORED into state. `drop` fires in the same task as the last
   // `dragover`, and a state update queued by that `dragover` has not been applied yet when it does,
@@ -251,6 +252,7 @@ export function Kanban({
                     onArchive={onArchive}
                     onDelete={onDelete}
                     onDispatch={onDispatch}
+                    onStopRun={onStopRun}
                     onDragStart={beginDrag}
                     onDragEnd={clearDrag}
                     t={t}

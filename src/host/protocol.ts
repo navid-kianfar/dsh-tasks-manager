@@ -24,6 +24,7 @@ import type {
   TaskQuery,
   TaskStatus,
 } from '../domain/types.ts'
+import type { GitAuthor } from './git-authors.ts'
 
 /** The logical RPC channel this plugin owns. One absolute segment, as the channel grammar requires. */
 export const TASKS_RPC_CHANNEL = '/dsh-tasks'
@@ -190,6 +191,23 @@ export interface JobKillResult {
 }
 
 /**
+ * `git.authors` — everyone who has committed to the session's project.
+ *
+ * The board's assignee is a person on the team, and a project's commit history is the roster it
+ * already carries. Session-scoped like every other endpoint: the browser never names a path, and
+ * the host reads git in the same project root the board lives in.
+ */
+export interface GitAuthorsResult {
+  /** The committers, most prolific first, with the configured identity marked. */
+  authors: GitAuthor[]
+  /**
+   * Whether git could be read at all. `false` — no git, or a project that is not a repository —
+   * lets the picker say why it has nobody to offer instead of showing an empty team.
+   */
+  available: boolean
+}
+
+/**
  * Every endpoint on {@link TASKS_RPC_CHANNEL}, as request/result pairs.
  *
  * The map exists so both halves derive their signatures from one declaration: the host's dispatch
@@ -213,7 +231,10 @@ export interface TasksRpcMap {
   'jobs.list': { request: JobsListRequest; result: { jobs: JobView[] } }
   'jobs.read': { request: JobReadRequest; result: JobReadResult }
   'jobs.kill': { request: JobKillRequest; result: JobKillResult }
+  'git.authors': { request: SessionScoped; result: GitAuthorsResult }
 }
+
+export type { GitAuthor } from './git-authors.ts'
 
 /** The endpoint names, as a union. */
 export type TasksRpcEndpoint = keyof TasksRpcMap
@@ -242,4 +263,5 @@ export const TASKS_RPC_ENDPOINTS = [
   'jobs.list',
   'jobs.read',
   'jobs.kill',
+  'git.authors',
 ] as const satisfies readonly TasksRpcEndpoint[]

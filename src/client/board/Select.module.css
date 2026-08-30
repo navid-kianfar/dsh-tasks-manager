@@ -1,0 +1,63 @@
+/* The select's own pieces. The trigger's shape and the list's surface come from the shared field
+   vocabulary and the design system's Menu; this file owns the dot and the widths. */
+
+/* Menu's wrapper is inline-flex by default, which would shrink the trigger to its text. The field
+   is a grid cell and fills it. */
+.anchor {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+}
+
+.trigger {
+  min-width: 0;
+}
+
+.row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The same colour vocabulary the columns and the list view already use, so a status means the same
+   thing wherever it is drawn. */
+.dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-label-tertiary);
+}
+
+.dot[data-status='todo'] {
+  background: var(--dsw-alias-label-secondary);
+}
+
+.dot[data-status='in_progress'] {
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.dot[data-status='blocked'] {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.dot[data-status='done'] {
+  background: var(--dsw-alias-state-success-primary);
+}
+
+.dot[data-priority='low'] {
+  background: var(--dsw-alias-label-dimmed);
+}
+
+.dot[data-priority='normal'] {
+  background: var(--dsw-alias-label-tertiary);
+}
+
+.dot[data-priority='high'] {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.dot[data-priority='urgent'] {
+  background: var(--dsw-alias-state-error-primary);
+}

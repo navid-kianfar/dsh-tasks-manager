@@ -18,7 +18,7 @@ import type {
   TaskQuery,
   TaskStatus,
 } from '../../domain/types.ts'
-import type { JobView } from '../../host/protocol.ts'
+import type { GitAuthor, JobView } from '../../host/protocol.ts'
 import type { SessionTodo } from './session-todo.ts'
 import type { TasksKey } from '../locales.ts'
 
@@ -56,6 +56,8 @@ export interface TaskActions {
   onDelete: (taskId: string) => void
   /** Hand a card to the agent to work in the background. */
   onDispatch: (taskId: string) => void
+  /** Stop the background run a card is being worked by. */
+  onStopRun: (jobId: string) => void
 }
 
 /** One card. */
@@ -156,6 +158,12 @@ export interface TaskDetailProps {
   canDispatch: boolean
   /** Whether delete is offered. */
   canDelete: boolean
+  /** Everyone who has committed to this project — the only people a card can be assigned to. */
+  assignees: readonly GitAuthor[]
+  /** Whether git could be read; `false` explains an empty assignee list rather than hiding it. */
+  assigneesAvailable: boolean
+  /** Every label in use across the board, offered as completions in the labels field. */
+  knownLabels: readonly string[]
   /** Close the panel. */
   onClose: () => void
   /** Rename the card. */
@@ -248,12 +256,19 @@ export interface BoardScreenProps {
   canDispatch: boolean
   /** Whether delete is offered. */
   canDelete: boolean
+  /** Everyone who has committed to this project, for the card detail's assignee field. */
+  assignees: readonly GitAuthor[]
+  /** Whether git could be read. */
+  assigneesAvailable: boolean
   /** Re-read the board now. */
   onRefresh: () => void
   /** Add a card. */
   onCreate: (title: string, status: TaskStatus) => void
   /** Everything the detail panel can do. */
-  detailActions: Omit<TaskDetailProps, 'detail' | 'loading' | 'canDispatch' | 'canDelete' | 't'>
+  detailActions: Omit<
+    TaskDetailProps,
+    'detail' | 'loading' | 'canDispatch' | 'canDelete' | 'assignees' | 'assigneesAvailable' | 'knownLabels' | 't'
+  >
   /** Everything a card can do. */
   taskActions: TaskActions
   /** Read a job's next output delta. */
