@@ -14,6 +14,8 @@ import {
   type TaskStoreOptions,
 } from '../../src/host/store.ts'
 import { currentRunOwner, type RunOwner } from '../../src/host/run-owner.ts'
+import { systemProbes } from '../../src/host/process-identity.ts'
+import { legacyStartRun } from './legacy-build.ts'
 import { TaskValidationError } from '../../src/domain/validate.ts'
 import type { Task, TaskStatus } from '../../src/domain/types.ts'
 
@@ -421,7 +423,8 @@ describe('runs', () => {
     const owner = currentRunOwner('s1')
     const running = store.startRun(task.id, 'task-1', owner, { actor: 'user', sessionId: 's1' }, tick())
     expect(running.runningJobId).toBe('task-1')
-    expect(store.runMarker(task.id)).toEqual({ taskId: task.id, ref: task.ref, jobId: 'task-1', owner })
+    expect(store.runMarker(task.id)).toMatchObject({ taskId: task.id, ref: task.ref, jobId: 'task-1', owner })
+    expect(running.runOwnerUnknown).toBeUndefined()
 
     const finished = store.finishRun(
       task.id,
@@ -544,6 +547,17 @@ describe('the stale-run sweep, judged by owner process', () => {
   }
 
   /**
+   * The owner record another process on this machine would have written.
+   * @param pid - that process's pid.
+   * @returns the owner, with the process start read the way that process would have read its own.
+   */
+  function ownerAt(pid: number): RunOwner {
+    const { processStart: _mine, ...rest } = currentRunOwner('s1')
+    const start = systemProbes.startToken(pid)
+    return { ...rest, pid, ...start === undefined ? {} : { processStart: start } }
+  }
+
+  /**
    * A board with one card whose run is owned as described.
    * @param owner - the owner to record.
    * @returns the store and the card id.
@@ -557,7 +571,8 @@ describe('the stale-run sweep, judged by owner process', () => {
 
   it('leaves a run owned by a live process on this host alone', async () => {
     const child = await otherProcess()
-    const { store, taskId } = markedBoard({ ...currentRunOwner('s1'), pid: child.pid as number, instance: 'b' })
+    const pid = child.pid as number
+    const { store, taskId } = markedBoard({ ...ownerAt(pid), instance: 'b' })
 
     expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
     expect(store.detail(taskId).task.runningJobId).toBe('task-1')
@@ -566,7 +581,7 @@ describe('the stale-run sweep, judged by owner process', () => {
   it('clears a run whose owner process has exited', async () => {
     const child = await otherProcess()
     const pid = child.pid as number
-    const { store, taskId } = markedBoard({ ...currentRunOwner('s1'), pid, instance: 'b' })
+    const { store, taskId } = markedBoard({ ...ownerAt(pid), instance: 'b' })
     const exited = new Promise<void>((resolve) => { child.once('exit', () => { resolve() }) })
     child.kill('SIGKILL')
     await exited
@@ -587,9 +602,96 @@ describe('the stale-run sweep, judged by owner process', () => {
     expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(1)
   })
 
-  it('never sweeps a run owned on another host, whose processes it cannot probe', () => {
-    const { store } = markedBoard({ ...currentRunOwner('s1'), host: 'some-other-host', pid: 1, instance: 'x' })
+  it('never sweeps a run owned on another machine, whose processes it cannot probe', () => {
+    const { store } = markedBoard({ ...currentRunOwner('s1'), machine: 'another-machine', pid: 1, instance: 'x' })
     expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
+  })
+
+  it('clears a run whose pid now belongs to a process that started later', async () => {
+    const child = await otherProcess()
+    const pid = child.pid as number
+    const reused = { ...ownerAt(pid), instance: 'b', processStart: 'linux:an-earlier-boot:1' }
+    if (process.platform === 'darwin') reused.processStart = 'darwin:1'
+    const { store, taskId } = markedBoard(reused)
+
+    const expected = process.platform === 'darwin' || process.platform === 'linux' ? 1 : 0
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(expected)
+    expect(store.detail(taskId).task.runningJobId === undefined).toBe(expected === 1)
+  })
+
+  it('keeps this process\'s run its own even when the host name it recorded has since changed', () => {
+    const { store, taskId } = markedBoard({ ...currentRunOwner('s1'), host: 'the-name-before-a-network-change' })
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
+    expect(store.detail(taskId).task.runningJobId).toBe('task-1')
+  })
+})
+
+describe('a running marker with no recorded owner', () => {
+  const directories: string[] = []
+
+  afterEach(() => {
+    for (const created of directories.splice(0)) rmSync(created, { recursive: true, force: true })
+  })
+
+  /**
+   * A file board with one card an older build marked running.
+   * @returns the store, the card id, and the database path.
+   */
+  function legacyMarked(): { store: TaskStore; taskId: string; path: string } {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-tasks-legacy-'))
+    directories.push(directory)
+    const path = join(directory, 'tasks.db')
+    const store = new TaskStore(path, OPTIONS)
+    open.push(store)
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    legacyStartRun(path, task.id, 'task-4', 's-old', tick())
+    return { store, taskId: task.id, path }
+  }
+
+  it('is never swept: no process can tell whether the build that wrote it is still running it', () => {
+    const { store, taskId } = legacyMarked()
+
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
+
+    const { task, activity } = store.detail(taskId)
+    expect(task.runningJobId).toBe('task-4')
+    expect(task.runOwnerUnknown).toBe(true)
+    expect(activity.map(entry => entry.kind)).toEqual(['created', 'run-started'])
+  })
+
+  it('carries the dispatch the board recorded for it, so the job registry can be asked about it', () => {
+    const { store, taskId } = legacyMarked()
+    expect(store.runMarker(taskId)).toMatchObject({ jobId: 'task-4', owner: undefined, started: { sessionId: 's-old', at: clock } })
+  })
+
+  it('is cleared on an explicit request that names the marker', () => {
+    const { store, taskId } = legacyMarked()
+
+    const task = store.clearUnknownRun(taskId, 'task-4', { actor: 'user', sessionId: 's1' }, tick())
+
+    expect(task.runningJobId).toBeUndefined()
+    expect(task.runOwnerUnknown).toBeUndefined()
+    expect(store.detail(taskId).activity.at(-1)).toMatchObject({ kind: 'run-finished', actor: 'user', from: 'task-4', to: 'interrupted' })
+  })
+
+  it('refuses a clear that names a different run, rather than clearing whatever holds the card now', () => {
+    const { store, taskId } = legacyMarked()
+    expect(() => store.clearUnknownRun(taskId, 'task-5', { actor: 'user' }, tick())).toThrow(TaskValidationError)
+    expect(store.detail(taskId).task.runningJobId).toBe('task-4')
+  })
+
+  it('refuses to clear a run whose owner is recorded; that run is stopped, not forgotten', () => {
+    const store = board()
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    store.startRun(task.id, 'task-1', currentRunOwner('s1'), { actor: 'user' }, tick())
+    expect(() => store.clearUnknownRun(task.id, 'task-1', { actor: 'user' }, tick())).toThrow(/stop/u)
+    expect(store.detail(task.id).task.runningJobId).toBe('task-1')
+  })
+
+  it('treats a clear that arrives after the marker is already gone as done', () => {
+    const { store, taskId } = legacyMarked()
+    store.clearUnknownRun(taskId, 'task-4', { actor: 'user' }, tick())
+    expect(store.clearUnknownRun(taskId, 'task-4', { actor: 'user' }, tick()).runningJobId).toBeUndefined()
   })
 })
 

@@ -96,12 +96,26 @@ export interface RunMarker {
   jobId: string
   /** The process and session that own the run; absent for a marker written before owners existed. */
   owner: RunOwner | undefined
+  /**
+   * The dispatch the history recorded for this job id: the session that started it and when. For a
+   * marker with no owner this is the only lead to the run — if that session is live in this process,
+   * its job registry can be asked about the job. Absent when the history holds no such entry.
+   */
+  started: RunStart | undefined
+}
+
+/** A `run-started` history entry, as a marker carries it. */
+export interface RunStart {
+  /** The session that dispatched the run, when the history recorded one. */
+  sessionId: string | undefined
+  /** Epoch ms the dispatch was recorded. */
+  at: number
 }
 
 /**
  * What the sweep should do with one marker.
  *
- * - `live`: leave it; its owner can still settle it.
+ * - `live`: leave it; its owner can still settle it, or nothing can tell that it cannot.
  * - `interrupted`: its owner is gone and nothing will ever settle it; clear it and say so in the history.
  * - `settled`: the run finished but its settlement never reached the board; record this outcome.
  */
@@ -118,13 +132,20 @@ export type RunJudge = (marker: RunMarker) => RunVerdict
  *
  * The default for a registry with no job registry to consult. A run owned by this very process is
  * `live` here because only the job registry could say otherwise; the service supplies a judge that
- * asks it. A marker with no recorded owner was written by a build that predates owners — no process
- * running this build can be settling it — so it is `interrupted`.
+ * asks it.
+ *
+ * A marker with no recorded owner is `live` too, and is never swept. It was written by a build that
+ * predates owners (or hand-edited), and that build may still be running it — in another dsh process
+ * that has had the board open since before the upgrade, or in this one before a plugin reload. No
+ * process can tell that run apart from a dead one, and clearing a live one re-offers Dispatch and
+ * puts two runs on the card. Such a marker is surfaced as "owner unknown" and cleared only when a
+ * person confirms it ({@link TaskStore.clearUnknownRun}), or when this process's job registry
+ * positively identifies the run and reports it finished (the service's judge).
  * @param marker - the marker to judge.
  * @returns the verdict.
  */
 export function judgeRunByProcess(marker: RunMarker): RunVerdict {
-  if (marker.owner === undefined) return { kind: 'interrupted' }
+  if (marker.owner === undefined) return { kind: 'live' }
   const state = ownerProcessState(marker.owner)
   switch (state) {
     case 'this-process':
@@ -195,6 +216,28 @@ interface TaskRow {
   last_run: string | null
   run_owner: string | null
 }
+
+/** A `tasks` row read together with its marker's `run-started` history entry. */
+interface MarkerRow extends TaskRow {
+  /** `{"sessionId": …, "at": …}` from the newest `run-started` entry naming the row's job id, or null. */
+  run_started: string | null
+}
+
+/**
+ * The columns a marker is read with: the row, and its newest `run-started` entry for the same job id
+ * as one JSON value — one statement however many markers there are, rather than a history lookup per
+ * card.
+ */
+const MARKER_COLUMNS = `
+  t.*,
+  (
+    SELECT json_object('sessionId', a.session_id, 'at', a.at)
+    FROM activity a
+    WHERE a.task_id = t.id AND a.kind = 'run-started' AND a.to_value = t.running_job_id
+    ORDER BY a.seq DESC
+    LIMIT 1
+  ) AS run_started
+`
 
 /** Shape one `comments` row comes back as. */
 interface CommentRow {
@@ -332,18 +375,36 @@ function toTask(row: TaskRow): Task {
     createdBy: row.created_by as TaskActor,
     ...row.session_id === null ? {} : { sessionId: row.session_id },
     ...row.running_job_id === null ? {} : { runningJobId: row.running_job_id },
+    ...row.running_job_id !== null && decodeRunOwner(row.run_owner) === undefined ? { runOwnerUnknown: true } : {},
     ...decodeRun(row.last_run) === undefined ? {} : { lastRun: decodeRun(row.last_run) as TaskRunSummary },
   }
 }
 
 /**
  * A row's running marker.
- * @param row - the `tasks` row.
+ * @param row - the `tasks` row, read with {@link MARKER_COLUMNS}.
  * @returns the marker, or `undefined` when the card is idle.
  */
-function toMarker(row: TaskRow): RunMarker | undefined {
+function toMarker(row: MarkerRow): RunMarker | undefined {
   if (row.running_job_id === null) return undefined
-  return { taskId: row.id, ref: row.ref, jobId: row.running_job_id, owner: decodeRunOwner(row.run_owner) }
+  return {
+    taskId: row.id,
+    ref: row.ref,
+    jobId: row.running_job_id,
+    owner: decodeRunOwner(row.run_owner),
+    started: decodeRunStart(row.run_started),
+  }
+}
+
+/**
+ * Decode the `run-started` entry a marker row was read with.
+ * @param raw - the JSON object the marker query built, or null.
+ * @returns the entry, or `undefined` when there is none.
+ */
+function decodeRunStart(raw: string | null): RunStart | undefined {
+  if (raw === null) return undefined
+  const parsed = JSON.parse(raw) as { sessionId: string | null; at: number }
+  return { sessionId: parsed.sessionId ?? undefined, at: parsed.at }
 }
 
 /**
@@ -1198,11 +1259,23 @@ export class TaskStore {
    * The rows carrying a running marker.
    * @returns the rows, bounded.
    */
-  #markerRows(): TaskRow[] {
-    return many<TaskRow>(
-      this.#prepare('SELECT * FROM tasks WHERE running_job_id IS NOT NULL ORDER BY id LIMIT ?'),
+  #markerRows(): MarkerRow[] {
+    return many<MarkerRow>(
+      this.#prepare(`SELECT ${MARKER_COLUMNS} FROM tasks t WHERE t.running_job_id IS NOT NULL ORDER BY t.id LIMIT ?`),
       MAX_QUERY_LIMIT,
     )
+  }
+
+  /**
+   * One card's row, read with its marker's history entry.
+   * @param taskId - the card.
+   * @returns the row.
+   * @throws TaskNotFoundError when the board has no such card.
+   */
+  #requireMarkerRow(taskId: string): MarkerRow {
+    const row = one<MarkerRow>(this.#prepare(`SELECT ${MARKER_COLUMNS} FROM tasks t WHERE t.id = ?`), taskId)
+    if (row === undefined) throw new TaskNotFoundError('task', taskId)
+    return row
   }
 
   /**
@@ -1212,7 +1285,44 @@ export class TaskStore {
    * @throws TaskNotFoundError when the board has no such card.
    */
   runMarker(taskId: string): RunMarker | undefined {
-    return toMarker(this.#requireRow(taskId))
+    return toMarker(this.#requireMarkerRow(taskId))
+  }
+
+  /**
+   * Clear a running marker whose owner is not recorded, because a person has confirmed it.
+   *
+   * The only way such a marker is cleared without this process's job registry vouching for the run
+   * (see {@link judgeRunByProcess}). The request names the job id the person was shown, and the clear
+   * is conditional on it inside the write transaction, so a confirmation given for one run can never
+   * clear another that took the card in the meantime. A marker whose owner IS recorded is refused:
+   * that run can be judged and stopped, and forgetting it would strand a live subagent.
+   * @param taskId - the card.
+   * @param jobId - the job id of the marker the person confirmed clearing.
+   * @param author - who confirmed it.
+   * @param now - epoch ms to stamp.
+   * @returns the card as it now stands; unchanged when the marker had already been cleared.
+   * @throws TaskNotFoundError when the board has no such card.
+   * @throws TaskValidationError when the card is held by a different run, or by one with a known owner.
+   */
+  clearUnknownRun(taskId: string, jobId: string, author: TaskAuthor, now: number): Task {
+    return this.#transaction(() => {
+      const row = this.#requireRow(taskId)
+      // Already settled or cleared by someone else: what the person asked for is true.
+      if (row.running_job_id === null) return toTask(row)
+      if (row.running_job_id !== jobId) {
+        throw new TaskValidationError(
+          `#${row.ref} is now running as job ${row.running_job_id}, not ${jobId}; nothing was cleared. Reload the board and decide again.`,
+        )
+      }
+      if (decodeRunOwner(row.run_owner) !== undefined) {
+        throw new TaskValidationError(
+          `#${row.ref}'s run records which dsh process owns it; stop the run instead of clearing its marker.`,
+        )
+      }
+      this.#prepare('UPDATE tasks SET running_job_id = NULL, run_owner = NULL, updated_at = ? WHERE id = ?').run(now, taskId)
+      this.#log(taskId, 'run-finished', author, now, jobId, 'interrupted')
+      return toTask(this.#requireRow(taskId))
+    })
   }
 
   /**
@@ -1255,7 +1365,7 @@ export class TaskStore {
    * @throws TaskNotFoundError when the board has no such card.
    */
   reconcileRun(taskId: string, judge: RunJudge, now: number): Task {
-    const row = this.#requireRow(taskId)
+    const row = this.#requireMarkerRow(taskId)
     const marker = toMarker(row)
     if (marker === undefined) return toTask(row)
     const verdict = judge(marker)

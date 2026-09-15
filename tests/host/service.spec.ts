@@ -15,7 +15,10 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import TasksService, { Config } from '../../src/host/index.ts'
+import type { TaskStore } from '../../src/host/store.ts'
 import { currentRunOwner } from '../../src/host/run-owner.ts'
+import { systemProbes } from '../../src/host/process-identity.ts'
+import { legacyStartRun } from './legacy-build.ts'
 import {
   FakeAgentRegistry,
   FakeJobRegistry,
@@ -266,13 +269,36 @@ describe('deleting a dispatched card', () => {
       await new Promise<void>((resolve) => { child.once('spawn', () => { resolve() }) })
       const board = h.ctx.tasks.boardForCwd(h.root)
       const card = board.create({ title: 'worked elsewhere' }, { actor: 'user' }, Date.now())
-      board.startRun(card.id, 'task-1', { ...currentRunOwner('s9'), pid: child.pid as number, instance: 'b' }, { actor: 'user' }, Date.now())
+      const pid = child.pid as number
+      const { processStart: _mine, ...owner } = currentRunOwner('s9')
+      const start = systemProbes.startToken(pid)
+      board.startRun(card.id, 'task-1', { ...owner, pid, instance: 'b', ...start === undefined ? {} : { processStart: start } }, { actor: 'user' }, Date.now())
 
       expect(() => { h.ctx.tasks.removeTask(board, card.id) }).toThrow(/another dsh process/u)
       expect(board.read().tasks).toHaveLength(1)
     } finally {
       child.kill('SIGKILL')
     }
+  })
+
+  it('stops this process\'s own run even after the host name it recorded has changed', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    h.agents.add('s1')
+    const board = h.ctx.tasks.boardForCwd(h.root)
+    const card = board.create({ title: 'renamed host' }, { actor: 'user' }, Date.now())
+    const agent = h.agents.get('s1')
+    if (agent === undefined) throw new Error('no agent')
+    const job = h.jobs.external('task', agent)
+    // What macOS does to a live process when the network changes: the host name it recorded no
+    // longer matches, while the machine identity is unavailable to the older record.
+    const { machine: _machine, ...owner } = currentRunOwner('s1')
+    board.startRun(card.id, job.id, { ...owner, host: 'the-name-before-a-network-change' }, { actor: 'user' }, Date.now())
+
+    h.ctx.tasks.removeTask(board, card.id)
+
+    expect(h.jobs.kills.map(kill => kill.id)).toEqual([job.id])
+    expect(board.read().tasks).toEqual([])
   })
 
   it('deletes an idle card without troubling the registry', async () => {
@@ -296,6 +322,125 @@ describe('deleting a dispatched card', () => {
     ctx.tasks.removeTask(board, card.id)
 
     expect(board.read().tasks).toEqual([])
+  })
+})
+
+describe('a card an older build marked running', () => {
+  /**
+   * A card carrying a marker exactly as the version-1 build writes one: no owner, and a
+   * `run-started` history entry naming the job and the session that dispatched it.
+   * @param h - the harness.
+   * @param jobId - the old process's job id.
+   * @param sessionId - the dispatching session.
+   * @param at - when that build recorded the dispatch.
+   * @returns the board and the card id.
+   */
+  function legacyCard(h: Harness, jobId: string, sessionId: string, at = Date.now()): { board: TaskStore; taskId: string } {
+    const board = h.ctx.tasks.boardForCwd(h.root)
+    const card = board.create({ title: 'card' }, { actor: 'user' }, Date.now())
+    legacyStartRun(board.databasePath, card.id, jobId, sessionId, at)
+    return { board, taskId: card.id }
+  }
+
+  it('is not dispatched again without the person confirming, because that run may still be live elsewhere', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    h.agents.add('s1')
+    const { board, taskId } = legacyCard(h, 'task-7', 'a-session-in-another-process')
+
+    await expect(h.ctx.tasks.dispatch('s1', taskId, undefined, NEVER)).rejects.toThrow(/does not record which dsh process owns it/u)
+
+    expect(board.detail(taskId).task.runningJobId).toBe('task-7')
+    expect(h.subagents.runs).toEqual([])
+  })
+
+  it('is replaced by a new run once the person confirms clearing that marker', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    h.agents.add('s1')
+    const { board, taskId } = legacyCard(h, 'task-7', 'a-session-in-another-process')
+
+    const { task } = await h.ctx.tasks.dispatch('s1', taskId, undefined, NEVER, 'task-7')
+
+    expect(task.runningJobId).toBe('task-1')
+    expect(task.runOwnerUnknown).toBeUndefined()
+    expect(board.detail(taskId).activity.map(entry => [entry.kind, entry.to])).toContainEqual(['run-finished', 'interrupted'])
+  })
+
+  it('does not take a confirmation for one run as consent to clear another', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    h.agents.add('s1')
+    const { board, taskId } = legacyCard(h, 'task-7', 'a-session-in-another-process')
+
+    await expect(h.ctx.tasks.dispatch('s1', taskId, undefined, NEVER, 'task-6')).rejects.toThrow(/does not record which dsh process owns it/u)
+    expect(board.detail(taskId).task.runningJobId).toBe('task-7')
+  })
+
+  it('is not deleted out from under that run without confirmation, and is once confirmed', async () => {
+    const h = await harness()
+    const { board, taskId } = legacyCard(h, 'task-7', 'a-session-in-another-process')
+
+    expect(() => { h.ctx.tasks.removeTask(board, taskId) }).toThrow(/does not record which dsh process owns it/u)
+    expect(board.read().tasks).toHaveLength(1)
+
+    h.ctx.tasks.removeTask(board, taskId, 'task-7')
+    expect(board.read().tasks).toEqual([])
+  })
+
+  it('is recorded as settled when this process\'s job registry positively knows the run has finished', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    const agent = h.agents.add('s1')
+    let finish: (outcome: { status: 'completed'; detail: string }) => void = () => {}
+    const done = new Promise<{ status: 'completed'; detail: string }>((resolve) => { finish = resolve })
+    // The run the old build of this plugin started in this very process, before a plugin reload.
+    const jobId = h.jobs.start({ kind: 'task', label: '#1 card', owner: agent, run: () => ({ cancel: () => {}, done }) })
+    const { board, taskId } = legacyCard(h, jobId, 's1')
+    finish({ status: 'completed', detail: 'finished' })
+    await settle()
+
+    saveSettings(h)
+    const reopened = h.ctx.tasks.boardForCwd(h.root)
+
+    expect(reopened.detail(taskId).task.runningJobId).toBeUndefined()
+    expect(reopened.detail(taskId).task.lastRun).toMatchObject({ jobId, status: 'completed' })
+    expect(board.databasePath).toBe(reopened.databasePath)
+  })
+
+  it('stays marked when this process has a finished job of the same id that is not that run', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    const agent = h.agents.add('s1')
+    const job = h.jobs.external('task', agent)
+    job.settle({ status: 'completed' })
+    await settle()
+    // Same session, same job id — but the board recorded that dispatch an hour before this job began.
+    const { taskId } = legacyCard(h, job.id, 's1', Date.now() - 3_600_000)
+
+    saveSettings(h)
+
+    expect(h.ctx.tasks.boardForCwd(h.root).detail(taskId).task.runningJobId).toBe(job.id)
+  })
+
+  it('stops the old build\'s run as its owner when this process still runs it and the marker is cleared', async () => {
+    const h = await harness()
+    h.sessions.add('s1', h.root)
+    const agent = h.agents.add('s1')
+    let cancelled = false
+    const jobId = h.jobs.start({
+      kind: 'task',
+      label: '#1 card',
+      owner: agent,
+      run: () => ({ cancel: () => { cancelled = true }, done: new Promise(() => {}) }),
+    })
+    const { board, taskId } = legacyCard(h, jobId, 's1')
+
+    const task = h.ctx.tasks.clearUnknownRun(board, taskId, jobId, { actor: 'user', sessionId: 's2' })
+
+    expect(cancelled).toBe(true)
+    expect(h.jobs.kills.map(kill => [kill.id, kill.caller])).toEqual([[jobId, 's1']])
+    expect(task.runningJobId).toBeUndefined()
   })
 })
 

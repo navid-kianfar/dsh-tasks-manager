@@ -116,6 +116,7 @@ export function TaskDetail({
 
   const due = describeDue(task.dueAt, Date.now(), t)
   const running = task.runningJobId !== undefined
+  const ownerUnknown = task.runOwnerUnknown === true
   const statusOptions = statusChoices(t)
   const priorityOptions = priorityChoices(t)
 
@@ -276,33 +277,34 @@ export function TaskDetail({
         {canDispatch && !task.archived && (
           <section className={css.section}>
             <div className={css.dispatch}>
-              {running
-                ? (
-                    <>
-                      <span className={css.runningPill}>
-                        <IconLoadingOutline16 size={14} className={css.spin} />
-                        {t('detail.dispatchRunning')}
-                      </span>
-                      <Button
-                        size="sm"
-                        icon={<IconStopFill16 size={14} />}
-                        onClick={() => { onStopRun(task.runningJobId as string) }}
-                      >
-                        {t('detail.dispatchStop')}
-                      </Button>
-                    </>
-                  )
-                : (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      icon={<IconPlayOutline16 size={14} />}
-                      onClick={() => { onDispatch(task.id) }}
-                    >
-                      {t('detail.dispatch')}
-                    </Button>
-                  )}
-              <span className={css.hint}>{t('detail.dispatchHint')}</span>
+              {running && (
+                <>
+                  <span className={css.runningPill}>
+                    <IconLoadingOutline16 size={14} className={css.spin} />
+                    {t(ownerUnknown ? 'detail.dispatchRunningOwnerUnknown' : 'detail.dispatchRunning')}
+                  </span>
+                  <Button
+                    size="sm"
+                    icon={<IconStopFill16 size={14} />}
+                    onClick={() => { onStopRun(task.runningJobId as string, task.id) }}
+                  >
+                    {t(ownerUnknown ? 'detail.clearRun' : 'detail.dispatchStop')}
+                  </Button>
+                </>
+              )}
+              {(!running || ownerUnknown) && (
+                // Offered beside an owner-unknown marker too: that run may be long dead, and the view
+                // asks the person to confirm replacing it.
+                <Button
+                  size="sm"
+                  variant="outline"
+                  icon={<IconPlayOutline16 size={14} />}
+                  onClick={() => { onDispatch(task.id) }}
+                >
+                  {t('detail.dispatch')}
+                </Button>
+              )}
+              <span className={css.hint}>{t(ownerUnknown ? 'detail.ownerUnknownHint' : 'detail.dispatchHint')}</span>
             </div>
             {task.lastRun !== undefined && !running && (
               <p className={css.muted}>

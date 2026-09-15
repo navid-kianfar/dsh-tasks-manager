@@ -31,8 +31,10 @@ import { TASK_STATUSES } from '../domain/types.ts'
  * - 2: `tasks.run_owner`, which process and session a running marker belongs to; triggers that
  *   advance `meta.revision` on any change to a card or comment, whoever makes it; and a `board` view
  *   ordered by workflow position rather than alphabetically.
+ * - 3: a guard trigger refusing to change the job id of a running marker whose owner is recorded
+ *   unless the same statement changes `run_owner` too ({@link RUN_MARKER_GUARD}).
  */
-export const TASKS_SCHEMA_VERSION = 2
+export const TASKS_SCHEMA_VERSION = 3
 
 /** Path of the board database relative to the project root. */
 export const DEFAULT_DATABASE_PATH = '.dsh/tasks.db'
@@ -131,6 +133,31 @@ const REVISION_TRIGGERS = (['tasks', 'comments'] as const)
   .join('\n')
 
 /**
+ * Refuse a write that replaces or clears an OWNED running marker's job id while leaving its owner.
+ *
+ * Every write this build makes to `running_job_id` sets `run_owner` in the same statement. The
+ * version-1 build does not know the column exists, and a process still running it keeps its handle
+ * across another process's upgrade: when its run finally settles it clears the card by id alone
+ * (`SET running_job_id = NULL`). By then the person may have cleared that build's marker and
+ * dispatched the card again, and the old settlement would null the new run's job id and leave its
+ * owner behind — two runs on the card, one of them invisible. A version-1 marker has no owner, so
+ * that build still settles its own runs; only a marker some newer run owns is protected.
+ *
+ * `ABORT` rather than `IGNORE`, so the refused write fails loudly — the old build's settlement is
+ * already written to catch and log a failed write — and a person clearing a marker by hand with
+ * `sqlite3` is told what to write instead of seeing a silent no-op.
+ */
+const RUN_MARKER_GUARD = `
+  CREATE TRIGGER IF NOT EXISTS tasks_run_marker_guard BEFORE UPDATE OF running_job_id ON tasks
+  WHEN OLD.run_owner IS NOT NULL
+    AND NEW.running_job_id IS NOT OLD.running_job_id
+    AND NEW.run_owner IS OLD.run_owner
+  BEGIN
+    SELECT RAISE(ABORT, 'tasks: this running marker records its owner; clear both columns together: SET running_job_id = NULL, run_owner = NULL');
+  END;
+`
+
+/**
  * The readable projection for people running `sqlite3` against the file by hand.
  *
  * Timestamps are stored as epoch milliseconds because that is what both halves of the plugin speak;
@@ -213,6 +240,7 @@ const SCHEMA = `
 
   INSERT OR IGNORE INTO meta (key, value) VALUES ('revision', '0');
 ${REVISION_TRIGGERS}
+${RUN_MARKER_GUARD}
 ${BOARD_VIEW}
 `
 
@@ -247,6 +275,8 @@ const MIGRATIONS: Readonly<Record<number, (db: DatabaseSync) => void>> = {
     addColumnIfMissing(db, 'tasks', 'run_owner', 'TEXT')
     db.exec('DROP VIEW IF EXISTS board')
   },
+  // Only a trigger is new, and the idempotent layout that runs after every migration creates it.
+  2: () => {},
 }
 
 /**

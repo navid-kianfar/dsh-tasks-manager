@@ -6,7 +6,12 @@
  */
 
 import { describe, expect, it, vi } from 'vitest'
-import { deleteConfirmation } from '../../src/client/TasksView.tsx'
+import {
+  clearRunConfirmation,
+  deleteConfirmation,
+  deleteUnknownRunConfirmation,
+  dispatchUnknownConfirmation,
+} from '../../src/client/TasksView.tsx'
 import { en, zh } from '../../src/client/locales.ts'
 import type { BoardTranslate } from '../../src/client/board/contract.ts'
 
@@ -33,4 +38,25 @@ describe('deleteConfirmation', () => {
   it('names the card in the Chinese description, which asks about it by number', () => {
     expect(deleteConfirmation(translator(zh), 7, vi.fn()).description).toContain('#7')
   })
+})
+
+describe('the owner-unknown run confirmations', () => {
+  const builders = [
+    ['clearing the marker', clearRunConfirmation],
+    ['dispatching again', dispatchUnknownConfirmation],
+    ['deleting the card', deleteUnknownRunConfirmation],
+  ] as const
+
+  for (const [action, build] of builders) {
+    it.each([['zh', zh], ['en', en]] as const)(`fills every placeholder in %s when ${action}`, (_language, dictionary) => {
+      const request = build(translator(dictionary), 12, 'task-4', vi.fn())
+
+      for (const line of [request.title, request.description, request.confirmLabel]) {
+        expect(line).not.toMatch(/\{\w+\}/u)
+      }
+      expect(request.title).toContain('#12')
+      // The person is told which run the marker names, since that is the run they are giving up on.
+      expect(request.description).toContain('task-4')
+    })
+  }
 })

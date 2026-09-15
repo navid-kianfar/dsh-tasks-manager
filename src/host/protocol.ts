@@ -117,6 +117,27 @@ export interface TaskArchiveRequest extends SessionScoped {
 export interface TaskDeleteRequest extends SessionScoped {
   /** The card to delete. */
   taskId: string
+  /**
+   * The job id of the card's owner-unknown running marker ({@link Task.runOwnerUnknown}), sent once
+   * the person has confirmed clearing it. Without it such a card is refused with a `bad-request`
+   * explaining why; a different job id is refused the same way, so a confirmation cannot clear a run
+   * the person was never shown.
+   */
+  clearUnknownRun?: string
+}
+
+/**
+ * `task.clearRun` — clear a card's owner-unknown running marker after the person confirmed it.
+ *
+ * For a marker whose owner is recorded there is no such request: that run is stopped with
+ * `jobs.kill`, and its marker clears when it settles. Refused with a `bad-request` when the card is
+ * held by a different job or by a run with a known owner; a marker already gone is not an error.
+ */
+export interface TaskClearRunRequest extends SessionScoped {
+  /** The card. */
+  taskId: string
+  /** The job id the marker showed when the person confirmed. */
+  jobId: string
 }
 
 /** `comment.add` — write a comment on a card. */
@@ -147,6 +168,8 @@ export interface TaskDispatchRequest extends SessionScoped {
   taskId: string
   /** Extra direction for this run, appended to the card's own title and body. */
   instructions?: string
+  /** As {@link TaskDeleteRequest.clearUnknownRun}: confirms replacing an owner-unknown marker. */
+  clearUnknownRun?: string
 }
 
 /** What a dispatch returned. */
@@ -249,6 +272,7 @@ export interface TasksRpcMap {
   'task.archive': { request: TaskArchiveRequest; result: Task }
   'task.restore': { request: TaskArchiveRequest; result: Task }
   'task.delete': { request: TaskDeleteRequest; result: { deleted: true } }
+  'task.clearRun': { request: TaskClearRunRequest; result: Task }
   'comment.add': { request: CommentAddRequest; result: TaskComment }
   'comment.edit': { request: CommentEditRequest; result: TaskComment }
   'comment.remove': { request: CommentRemoveRequest; result: { deleted: true } }
@@ -281,6 +305,7 @@ export const TASKS_RPC_ENDPOINTS = [
   'task.archive',
   'task.restore',
   'task.delete',
+  'task.clearRun',
   'comment.add',
   'comment.edit',
   'comment.remove',

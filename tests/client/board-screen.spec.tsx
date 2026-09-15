@@ -160,6 +160,21 @@ describe('BoardScreen', () => {
     expect(card?.textContent).toContain('card.running')
   })
 
+  it('says a run\'s owner is unknown, and hands its card to the Stop action so the view can confirm clearing', () => {
+    const onStopRun = vi.fn()
+    const card = task({ ref: 8, runningJobId: 'task-4', runOwnerUnknown: true })
+    const { container } = render({
+      view: view([card]),
+      taskActions: { onOpen: vi.fn(), onMove: vi.fn(), onArchive: vi.fn(), onDelete: vi.fn(), onDispatch: vi.fn(), onStopRun },
+    })
+    const article = container.querySelector('article[data-task-id]')
+    expect(article?.textContent).toContain('card.runningOwnerUnknown')
+
+    act(() => { container.querySelector<HTMLButtonElement>('button[aria-label="card.clearRun"]')?.click() })
+
+    expect(onStopRun).toHaveBeenCalledWith('task-4', card.id)
+  })
+
   it('marks priority on the card so urgency survives a monochrome scan', () => {
     const { container } = render({ view: view([task({ ref: 1, priority: 'urgent' })]) })
     const card = container.querySelector('article[data-task-id]')
@@ -318,8 +333,9 @@ describe('BoardScreen', () => {
 
   it('offers a stop control on a card the agent is working', () => {
     const onStopRun = vi.fn()
+    const card = task({ ref: 1, runningJobId: 'task-3' })
     const { container } = render({
-      view: view([task({ ref: 1, runningJobId: 'task-3' })]),
+      view: view([card]),
       taskActions: {
         onOpen: vi.fn(), onMove: vi.fn(), onArchive: vi.fn(), onDelete: vi.fn(), onDispatch: vi.fn(), onStopRun,
       },
@@ -329,7 +345,7 @@ describe('BoardScreen', () => {
     expect(stop).not.toBeUndefined()
 
     act(() => { stop?.click() })
-    expect(onStopRun).toHaveBeenCalledWith('task-3')
+    expect(onStopRun).toHaveBeenCalledWith('task-3', card.id)
   })
 
   it('leaves an idle card without a stop control', () => {

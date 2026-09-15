@@ -242,6 +242,22 @@ const DELETED_CARD_REASON = 'the card it was working was deleted from the task b
 /** The reason recorded on a run stopped from the board. */
 const STOPPED_FROM_BOARD_REASON = 'stopped from the task board'
 
+/** The reason recorded on an older build's run stopped because a person cleared its marker. */
+const CLEARED_MARKER_REASON = 'its running marker was cleared from the task board'
+
+/**
+ * How far the job registry's start time for a run may be from the dispatch the board recorded, for
+ * the registry's job to be taken as that run.
+ *
+ * A marker with no owner names only a job id and, through its history, the session that dispatched
+ * it. Job ids are per-process counters and one session can be live in two processes, so a job of
+ * that id and session in this registry may be a different run. The dispatch is recorded moments
+ * before the registry stamps the job's start, so the two agree to within milliseconds for the same
+ * run; a different run with the same id and session would have to have been started within this
+ * window too. Wide enough for a slow event loop, narrow enough that a coincidence is not credible.
+ */
+const UNOWNED_RUN_START_TOLERANCE_MS = 10_000
+
 /** The job registry as this plugin reaches it. */
 type JobRegistryFace = Context['jobs']
 
@@ -687,8 +703,19 @@ export class TasksService extends Service {
           parseTaskId(requireString(payload, 'taskId')), false, author, now,
         )
       case 'task.delete':
-        this.removeTask(await this.boardForSession(sessionId), parseTaskId(requireString(payload, 'taskId')))
+        this.removeTask(
+          await this.boardForSession(sessionId),
+          parseTaskId(requireString(payload, 'taskId')),
+          readOptionalString(payload, 'clearUnknownRun'),
+        )
         return { deleted: true }
+      case 'task.clearRun':
+        return this.clearUnknownRun(
+          await this.boardForSession(sessionId),
+          parseTaskId(requireString(payload, 'taskId')),
+          requireString(payload, 'jobId'),
+          author,
+        )
       case 'comment.add':
         return (await this.boardForSession(sessionId)).addComment(
           parseTaskId(requireString(payload, 'taskId')), requireString(payload, 'body'), author, now,
@@ -708,6 +735,7 @@ export class TasksService extends Service {
           parseTaskId(requireString(payload, 'taskId')),
           readOptionalString(payload, 'instructions'),
           signal,
+          readOptionalString(payload, 'clearUnknownRun'),
         )
       case 'jobs.list':
         return { jobs: this.listJobs(sessionId) }
@@ -814,7 +842,7 @@ export class TasksService extends Service {
     const marker = board.runMarkers().find(entry =>
       entry.jobId === jobId && entry.owner !== undefined && ownerProcessState(entry.owner) === 'this-process')
     if (marker?.owner === undefined) return undefined
-    return this.ownedTaskJob(marker.jobId, marker.owner)
+    return this.ownedTaskJob(marker.jobId, marker.owner.sessionId)
   }
 
   /**
@@ -824,13 +852,13 @@ export class TasksService extends Service {
    * The kind check matters because a marker is a row in a file: a hand-edited `running_job_id`
    * naming someone's shell job must not let a card deletion stop that job with its owner's authority.
    * @param jobId - the job id the marker records.
-   * @param owner - the marker's owner.
+   * @param sessionId - the session the run belongs to.
    * @returns the registry, the owning agent, and the job's snapshot; `undefined` when the registry,
    *   the owner agent, or the job is gone, or the job is not a card run.
    */
-  private ownedTaskJob(jobId: string, owner: RunOwner): OwnedRun | undefined {
+  private ownedTaskJob(jobId: string, sessionId: string): OwnedRun | undefined {
     const jobs = this.ctx.get('jobs')
-    const agent = this.agentFor(owner.sessionId)
+    const agent = this.agentFor(sessionId)
     if (jobs === undefined || agent === undefined) return undefined
     let snapshot: JobSnapshot
     try {
@@ -853,37 +881,84 @@ export class TasksService extends Service {
    * the job registry, the only authority on it: still running is live; settled means its settlement
    * never reached the card, so the registry's terminal record is written instead; unknown means the
    * registry — or the agent that owned the job — is gone, and so is the run.
+   *
+   * A marker with no recorded owner is live unless this process's registry positively identifies
+   * its run and reports it finished ({@link unownedRunInThisProcess}). Anything short of that —
+   * no such job here, a job that does not match — leaves the marker for a person to clear.
    * @param marker - the marker to judge.
    * @returns the verdict.
    */
   private judgeRun(marker: RunMarker): RunVerdict {
     const owner = marker.owner
-    if (owner === undefined || ownerProcessState(owner) !== 'this-process') return judgeRunByProcess(marker)
-    const owned = this.ownedTaskJob(marker.jobId, owner)
+    if (owner === undefined) {
+      const identified = this.unownedRunInThisProcess(marker)
+      if (identified === undefined || !TERMINAL_JOB_STATUSES.has(identified.snapshot.status)) return { kind: 'live' }
+      return verdictFromSnapshot(marker.jobId, identified.snapshot)
+    }
+    if (ownerProcessState(owner) !== 'this-process') return judgeRunByProcess(marker)
+    const owned = this.ownedTaskJob(marker.jobId, owner.sessionId)
     if (owned === undefined) return { kind: 'interrupted' }
-    const { snapshot } = owned
-    switch (snapshot.status) {
-      case 'running':
-      case 'stopping':
-        return { kind: 'live' }
-      case 'completed':
-      case 'killed':
-      case 'failed':
-        return {
-          kind: 'settled',
-          summary: {
-            jobId: marker.jobId,
-            status: snapshot.status,
-            ...snapshot.detail === undefined ? {} : { detail: snapshot.detail },
-            startedAt: snapshot.startedAt,
-            finishedAt: snapshot.finishedAt ?? Date.now(),
-          },
-        }
-      default: {
-        const unexpected: never = snapshot.status
-        throw new Error(`tasks: unexpected job status ${String(unexpected)}`)
+    return verdictFromSnapshot(marker.jobId, owned.snapshot)
+  }
+
+  /**
+   * The run behind a marker with no recorded owner, when this process's job registry holds it.
+   *
+   * The history's `run-started` entry names the dispatching session. If that session's agent is live
+   * here and owns a card-run job of the marker's id, that job is the run only if it is also for this
+   * card and started when the board recorded the dispatch; see {@link UNOWNED_RUN_START_TOLERANCE_MS}
+   * for why the id and session alone are not enough.
+   * @param marker - a marker with no owner.
+   * @returns the run, or `undefined` when this process cannot vouch for it.
+   */
+  private unownedRunInThisProcess(marker: RunMarker): OwnedRun | undefined {
+    const started = marker.started
+    if (started?.sessionId === undefined) return undefined
+    const run = this.ownedTaskJob(marker.jobId, started.sessionId)
+    if (run === undefined) return undefined
+    if (!run.snapshot.label.startsWith(`#${marker.ref} `)) return undefined
+    if (Math.abs(run.snapshot.startedAt - started.at) > UNOWNED_RUN_START_TOLERANCE_MS) return undefined
+    return run
+  }
+
+  /**
+   * Clear a card's running marker whose owner is unknown, as a person has confirmed.
+   *
+   * If this process still runs the job behind it — the older build's run, started here before a
+   * plugin reload — the job is stopped as its owner first, so clearing the marker does not leave a
+   * subagent working a card that now looks idle. Otherwise the run, if it is live at all, is in a
+   * process this one cannot reach, and the person has accepted that.
+   * @param board - the board the card belongs to.
+   * @param taskId - the card.
+   * @param jobId - the job id of the marker the person was shown.
+   * @param author - who confirmed it.
+   * @returns the card as it now stands.
+   * @throws TaskValidationError when the card is held by a different run or one with a known owner.
+   */
+  clearUnknownRun(board: TaskStore, taskId: string, jobId: string, author: TaskAuthor): Task {
+    const marker = board.runMarker(taskId)
+    if (marker?.owner === undefined && marker?.jobId === jobId) {
+      const identified = this.unownedRunInThisProcess(marker)
+      if (identified !== undefined && !TERMINAL_JOB_STATUSES.has(identified.snapshot.status)) {
+        identified.jobs.kill(jobId as never, identified.agent, CLEARED_MARKER_REASON)
       }
     }
+    return board.clearUnknownRun(taskId, jobId, author, Date.now())
+  }
+
+  /**
+   * Make sure a marker with no owner may be cleared on the person's behalf.
+   * @param marker - the card's marker, with no owner.
+   * @param confirmedJobId - the job id the person confirmed clearing, if any.
+   * @throws TaskValidationError when the person has not confirmed clearing THIS marker.
+   */
+  private requireUnknownRunConfirmed(marker: RunMarker, confirmedJobId: string | undefined): void {
+    if (confirmedJobId === marker.jobId) return
+    throw new TaskValidationError(
+      `#${marker.ref} is marked as running job ${marker.jobId}, but the marker does not record which dsh process owns it `
+      + '(it was written by an older build of this plugin, or edited by hand), so that run may still be live in another dsh process. '
+      + 'Clear the marker from the task board, which asks you to confirm, or wait for that run to finish.',
+    )
   }
 
   /**
@@ -897,6 +972,8 @@ export class TasksService extends Service {
    * spending tokens on work whose record has been thrown away. So:
    *
    * - A marker whose owner is gone is cleared first; there is nothing to stop.
+   * - A marker with no recorded owner is refused unless the person confirmed clearing that marker;
+   *   then any run of it this process still holds is stopped and the marker cleared.
    * - A run this process owns is stopped AS ITS OWNER. The registry fences jobs by owning session, and
    *   any session on the project can open the board, so stopping it as the deleting session failed
    *   with "belongs to another session" — the failure was swallowed and the subagent kept running.
@@ -904,12 +981,19 @@ export class TasksService extends Service {
    *   message saying so, rather than deleting the card out from under that run.
    * @param board - the board the card belongs to.
    * @param taskId - the card to delete.
-   * @throws TaskValidationError when a run in another process is still working the card.
+   * @param clearUnknownRun - the job id of an owner-unknown marker the person confirmed clearing.
+   * @throws TaskValidationError when a run in another process is still working the card, or an
+   *   owner-unknown marker holds it without confirmation.
    */
-  removeTask(board: TaskStore, taskId: string): void {
+  removeTask(board: TaskStore, taskId: string, clearUnknownRun?: string): void {
     board.reconcileRun(taskId, marker => this.judgeRun(marker), Date.now())
     const marker = board.runMarker(taskId)
-    if (marker !== undefined) this.stopRunForDeletion(marker)
+    if (marker !== undefined && marker.owner === undefined) {
+      this.requireUnknownRunConfirmed(marker, clearUnknownRun)
+      this.clearUnknownRun(board, taskId, marker.jobId, { actor: 'user' })
+    } else if (marker !== undefined) {
+      this.stopRunForDeletion(marker)
+    }
     board.remove(taskId)
   }
 
@@ -920,7 +1004,7 @@ export class TasksService extends Service {
    */
   private stopRunForDeletion(marker: RunMarker): void {
     const owner = marker.owner
-    // A marker with no owner is never judged live, so it has been cleared already.
+    // A marker with no owner is handled, with the person's confirmation, before this is reached.
     if (owner === undefined) return
     if (ownerProcessState(owner) !== 'this-process') {
       throw new TaskValidationError(
@@ -928,7 +1012,7 @@ export class TasksService extends Service {
         + 'Stop it from that process, or wait for it to finish, then delete the card.',
       )
     }
-    const owned = this.ownedTaskJob(marker.jobId, owner)
+    const owned = this.ownedTaskJob(marker.jobId, owner.sessionId)
     // Judged live a moment ago; a run that settled in between has nothing left to stop.
     if (owned === undefined) return
     owned.jobs.kill(marker.jobId as never, owned.agent, DELETED_CARD_REASON)
@@ -945,24 +1029,30 @@ export class TasksService extends Service {
    * @param taskId - the card to work.
    * @param instructions - extra direction for this run.
    * @param signal - cancellation for the dispatch call itself, not for the run it starts.
+   * @param clearUnknownRun - the job id of an owner-unknown marker the person confirmed clearing.
    * @returns the job id and the card carrying it.
-   * @throws TaskValidationError when the deployment cannot run a background card.
+   * @throws TaskValidationError when the deployment cannot run a background card, or the card is held
+   *   by a run — including one whose owner is unknown and whose clearing was not confirmed.
    */
   async dispatch(
     sessionId: string,
     taskId: string,
     instructions: string | undefined,
     signal: AbortSignal,
+    clearUnknownRun?: string,
   ): Promise<TaskDispatchResult> {
     const config = this.config()
     const board = this.boardFor(sessionId)
     // A marker whose owner has gone is cleared here rather than refused as "already running": this is
     // the moment someone is asking to run the card again.
-    const current = board.reconcileRun(taskId, marker => this.judgeRun(marker), Date.now())
-    if (current.runningJobId !== undefined) {
-      throw new TaskValidationError(`#${current.ref} is already running as job ${current.runningJobId}`)
+    board.reconcileRun(taskId, marker => this.judgeRun(marker), Date.now())
+    const held = board.runMarker(taskId)
+    const unknown = held?.owner === undefined ? held : undefined
+    if (unknown !== undefined) {
+      this.requireUnknownRunConfirmed(unknown, clearUnknownRun)
+    } else if (held !== undefined) {
+      throw new TaskValidationError(`#${held.ref} is already running as job ${held.jobId}`)
     }
-    const detail = board.detail(taskId)
 
     const jobs = this.ctx.get('jobs')
     const subagents = this.ctx.get('subagents')
@@ -983,6 +1073,11 @@ export class TasksService extends Service {
     signal.throwIfAborted()
 
     const author: TaskAuthor = { actor: 'user', sessionId }
+    // Cleared only now, once nothing is left that could refuse the dispatch: a confirmation to run the
+    // card again is not a confirmation to leave it idle. The clear is conditional on the confirmed job
+    // id, and the claim below on the card being idle, so a run that took the card meanwhile wins.
+    if (unknown !== undefined) this.clearUnknownRun(board, taskId, unknown.jobId, author)
+    const detail = board.detail(taskId)
     const startedAt = Date.now()
     const databasePath = board.databasePath
     const owner = currentRunOwner(sessionId)
@@ -1186,6 +1281,37 @@ export function buildDispatchPrompt(detail: TaskDetail, instructions: string | u
     'When you are done, report what you changed. Do not mark the task done yourself — the board records the outcome of this run.',
   )
   return lines.join('\n')
+}
+
+/**
+ * The sweep's verdict on a run from the job registry's record of it.
+ * @param jobId - the marker's job id.
+ * @param snapshot - the registry's snapshot of that job.
+ * @returns `live` while it runs; `settled` with the registry's terminal record once it has finished.
+ */
+function verdictFromSnapshot(jobId: string, snapshot: JobSnapshot): RunVerdict {
+  switch (snapshot.status) {
+    case 'running':
+    case 'stopping':
+      return { kind: 'live' }
+    case 'completed':
+    case 'killed':
+    case 'failed':
+      return {
+        kind: 'settled',
+        summary: {
+          jobId,
+          status: snapshot.status,
+          ...snapshot.detail === undefined ? {} : { detail: snapshot.detail },
+          startedAt: snapshot.startedAt,
+          finishedAt: snapshot.finishedAt ?? Date.now(),
+        },
+      }
+    default: {
+      const unexpected: never = snapshot.status
+      throw new Error(`tasks: unexpected job status ${String(unexpected)}`)
+    }
+  }
 }
 
 /** A run of this process, reachable as its owner. */

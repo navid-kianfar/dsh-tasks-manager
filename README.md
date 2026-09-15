@@ -44,6 +44,8 @@ When it ends, the card's last run records the status (`completed`, `failed`, or 
 
 Deleting a running card first stops its run, acting as the session that owns the job. If the run belongs to another live `dsh` process, the delete is refused.
 
+A card marked running by an older build of this plugin shows **Running (owner unknown)**: that marker does not say which `dsh` process owns the run, so it is never cleared automatically. Its stop control becomes **Clear the running marker**, and **Dispatch to agent** and **Delete** stay available; each of the three asks you to confirm first, because the old run may still be going in another `dsh` process, and clearing the marker does not stop it there. See [Run ownership](#run-ownership-and-stale-markers).
+
 ### Settings card
 
 **Settings → Plugins → Task management** edits the fields marked in [Configuration](#configuration).
@@ -163,7 +165,7 @@ Tools resolve the board from the calling agent's session directory. Cards can be
 | `task_list` | Read the board with filters (`status`, `priority`, `labels`, `assignee`, `search`, `archived`, `limit`). `sort: urgency` returns only unfinished, unarchived cards, most pressing first. |
 | `task_update` | Change title, body, status, priority, labels (replaces the set), assignee, due date, or `archived`. |
 | `task_comment` | Add a Markdown comment. |
-| `task_delete` | Permanently delete a card, its comments, and history, stopping any run first. Registered only with `allowDelete: true`. |
+| `task_delete` | Permanently delete a card, its comments, and history, stopping any run first. Refuses a card whose running marker has no recorded owner; a person clears that marker on the board. Registered only with `allowDelete: true`. |
 
 Limits: title 200 characters, body and comment 20,000, up to 20 labels of 40 characters, assignee 80.
 
@@ -171,7 +173,9 @@ Limits: title 200 characters, body and comment 20,000, up to 20 labels of 40 cha
 
 The browser half talks to the host over the harness's unary RPC channel at `/dsh-tasks`. The route is mounted on the web server behind the connection's request gate (Host/Origin check and browser token). Every request carries a `sessionId`; the host resolves the board from that session's working directory, and the browser never sends a filesystem path. Validation errors, unknown cards, and stale edits and moves come back as `bad-request`.
 
-Endpoints: `board.read`, `board.revision`, `task.detail`, `task.create`, `task.update` (optional `expectedUpdatedAt`), `task.move` (optional `expectedUpdatedAt`), `task.archive`, `task.restore`, `task.delete`, `comment.add`, `comment.edit`, `comment.remove`, `task.dispatch`, `jobs.list`, `jobs.read`, `jobs.kill`, `git.authors`.
+Endpoints: `board.read`, `board.revision`, `task.detail`, `task.create`, `task.update` (optional `expectedUpdatedAt`), `task.move` (optional `expectedUpdatedAt`), `task.archive`, `task.restore`, `task.delete` (optional `clearUnknownRun`), `task.clearRun` (`taskId`, `jobId`), `comment.add`, `comment.edit`, `comment.remove`, `task.dispatch` (optional `clearUnknownRun`), `jobs.list`, `jobs.read`, `jobs.kill`, `git.authors`.
+
+A card whose running marker records no owner carries `runOwnerUnknown: true`. `task.dispatch` and `task.delete` refuse such a card with `bad-request` unless `clearUnknownRun` names the marker's job id, which the browser sends only after the person confirms; `task.clearRun` clears the marker on its own. A job id that no longer matches the marker is refused, so a confirmation never clears a run the person was not shown.
 
 ## Data and storage
 
@@ -192,9 +196,9 @@ sqlite3 .dsh/tasks.db "select card, title, status, assignee from board where sta
 sqlite3 .dsh/tasks.db ".backup tasks-backup.db"
 ```
 
-### Upgrading from layout version 1
+### Upgrading an existing board
 
-The layout version is stored in `PRAGMA user_version`; this build writes version **2**. Boards created by the published 0.2.2 and earlier are version 1. The first time this build opens one, it upgrades the file in place, in one transaction: it adds the `tasks.run_owner` column, installs the revision triggers, and recreates the `board` view. No rows are dropped or rewritten.
+The layout version is stored in `PRAGMA user_version`; this build writes version **3**. Boards created by the published 0.2.2 and earlier are version 1; version 2 was only ever written by unreleased development builds. The first time this build opens an older board, it upgrades the file in place, in one transaction: it adds the `tasks.run_owner` column (from version 1), installs the revision triggers and the running-marker guard trigger, and recreates the `board` view. No rows are dropped or rewritten, and no running marker is cleared by the upgrade.
 
 Copy the file aside before the first start, because the upgrade is one-way:
 
@@ -205,17 +209,24 @@ cp .dsh/tasks.db .dsh/tasks.v1-backup.db
 After the upgrade:
 
 - An older build process that already had the board open keeps working and its writes still move the revision. An older build that opens the file afterwards refuses it, because it only reads version 1. A file stamped with a version newer than this build is refused in the same way.
-- A running marker without an owner (written by an older build) is cleared as interrupted the next time this build opens the board. Do not dispatch from an older and a newer build against the same board at the same time.
+- A running marker written by an older build has no owner. It is **kept**, shown as **Running (owner unknown)**, and cleared only when you confirm it on the board (Clear the running marker, Dispatch to agent, or Delete), or when this process's own job registry identifies that run and reports it finished (the older build's run in this same process, before a plugin reload). It is not cleared on open, because the older build may still be running it.
+- If you clear such a marker and dispatch again while the older build's run is in fact still going, that run's eventual settlement is refused by the guard trigger instead of clearing the new run's marker. The older build logs the failed write and carries on; the new run is unaffected. Stop the older process's run from that process if you do not want two runs of the card.
 
 ### Run ownership and stale markers
 
-A running card stores `running_job_id` and `run_owner`, a JSON object `{host, pid, instance, sessionId}`. A process clears a marker only when:
+A running card stores `running_job_id` and `run_owner`, a JSON object `{host, machine, pid, processStart, instance, sessionId}`. Markers written by development builds of version 2 have only `{host, pid, instance, sessionId}` and are still read.
 
-- the marker has no owner or an unreadable one;
-- its owner process on the same host has exited; or
-- the marker is this process's own run, and the job registry reports the job settled or no longer knows it.
+- **`instance`** is a random id per `dsh` process. It is checked first: a marker with this process's instance is this process's, even if the host name has changed since.
+- **`machine`** is a salted SHA-256 digest of the machine's stable id: `IOPlatformUUID` on macOS (read once per process with `/usr/sbin/ioreg`), `/etc/machine-id` or `/var/lib/dbus/machine-id` plus the pid namespace on Linux, `MachineGuid` on Windows (read once with `reg.exe`). If none can be read, the host name is used instead. `host` is still written, for people reading the row, and is compared only for markers without `machine`.
+- **`processStart`** is the owning process's start: ticks since boot plus the boot id from `/proc` on Linux, the `ps -o lstart` time on macOS (compared within 30 seconds). It is omitted where the platform offers neither, including Windows.
 
-Markers from another live process are left alone. **Markers owned on another host are never cleared automatically.** To clear one by hand (the board picks it up on the next poll):
+A process clears a marker only when:
+
+- its owner is on this machine, and the owner process has exited, or its pid is now held by a process with a different start time;
+- the marker is this process's own run, and the job registry reports the job settled or no longer knows it; or
+- the marker has no owner, and either you confirmed clearing it on the board, or this process's job registry holds a `task` job with the same id, for the same card and dispatching session, started within 10 seconds of the recorded dispatch, and that job has finished.
+
+Markers from another live process are left alone, as are markers whose owner start time cannot be read. **Markers owned on another machine are never cleared automatically.** To clear one by hand (the board picks it up on the next poll), clear both columns in one statement; a statement that clears `running_job_id` of an owned marker alone is refused by the guard trigger:
 
 ```bash
 sqlite3 .dsh/tasks.db "UPDATE tasks SET running_job_id = NULL, run_owner = NULL WHERE ref = 12"
@@ -225,13 +236,16 @@ sqlite3 .dsh/tasks.db "UPDATE tasks SET running_job_id = NULL, run_owner = NULL 
 
 - **Git reads are hardened.** The assignee picker runs `git --no-pager -c log.showSignature=false -c core.fsmonitor=false -c core.pager=cat -C <root> log --no-show-signature …`, plus two `git config --get` calls, with a 5-second timeout and a 4 MB output cap. A repository's own `.git/config` cannot make opening the board run `gpg.program` or an fsmonitor hook. Nothing is written to git. Results are cached per project for 60 seconds.
 - **Runs are stopped as their owner.** **Stop** on a job the session can see acts as that session, the same as `job_kill`. A card's run started by another session in this process is stopped as its owning session, and only if the job's kind is `task`. A hand-edited `running_job_id` that points at someone's shell job cannot be used to stop that job.
-- **Deletes respect other processes.** A card whose run belongs to another live process cannot be deleted from this one.
+- **Deletes respect other processes.** A card whose run belongs to another live process cannot be deleted from this one. A card whose run has no recorded owner is deleted only after you confirm.
+- **Owner checks run fixed system tools.** Besides `git`, the host may run `/usr/sbin/ioreg` (macOS) or `reg.exe` (Windows) once per process to read the machine id, and `/bin/ps -o lstart= -p <pid>` (macOS) when judging another live process's marker on this machine. Each runs without a shell, from an absolute path, with a 2-second timeout; the only value taken from the board is the pid, which must be a positive integer. On Linux only files under `/proc`, `/etc`, and `/var/lib/dbus` are read. The machine id is stored only as a salted digest.
 - **The model cannot delete by default.** `task_delete` is only registered with `allowDelete: true`.
 - **Job output is not taken from the agent.** The board reads output only for its own `task` jobs, which return final output without consuming the agent's read cursor.
 
 ## Known limitations
 
-- **Markers owned on another host are never auto-cleared.** See [Run ownership](#run-ownership-and-stale-markers).
+- **Markers owned on another machine are never auto-cleared.** See [Run ownership](#run-ownership-and-stale-markers).
+- **Markers written by an older build are never auto-cleared** unless this process's job registry identifies the run as finished. Clearing one is your call on the board.
+- **Machines with a cloned machine id** (for example VM images that were not re-sealed) look like one machine, so a marker from the other could be swept when its pid is not found locally. Linux containers are told apart by pid namespace.
 - **Dispatch needs a live session.** A tab on a session that is no longer live can read and edit the board but cannot dispatch.
 - **Board state is not in the session log.** An out-of-tree plugin cannot add session event types, so history lives only in `tasks.db`.
 

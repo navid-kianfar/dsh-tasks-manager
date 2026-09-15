@@ -60,8 +60,12 @@ export interface TaskActions {
   onDelete: (taskId: string) => void
   /** Hand a card to the agent to work in the background. */
   onDispatch: (taskId: string) => void
-  /** Stop the background run a card is being worked by. */
-  onStopRun: (jobId: string) => void
+  /**
+   * Stop the background run a card is being worked by. For a card whose run has no recorded owner
+   * ({@link Task.runOwnerUnknown}) the view asks the person to confirm clearing the marker instead,
+   * which is why the card is passed too.
+   */
+  onStopRun: (jobId: string, taskId: string) => void
 }
 
 /** One card. */
@@ -193,8 +197,8 @@ export interface TaskDetailProps {
   onDelete: (taskId: string) => void
   /** Dispatch the card to the agent. */
   onDispatch: (taskId: string) => void
-  /** Stop the card's running background job. */
-  onStopRun: (jobId: string) => void
+  /** Stop the card's running background job, or clear an owner-unknown marker; see {@link TaskActions}. */
+  onStopRun: (jobId: string, taskId: string) => void
   /** Write a comment. */
   onComment: (taskId: string, body: string) => void
   /** Rewrite a comment. */

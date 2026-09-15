@@ -85,6 +85,75 @@ export function deleteConfirmation(t: BoardTranslate, ref: number | undefined, o
 }
 
 /**
+ * The confirmation shown before a card whose run has no recorded owner is deleted.
+ *
+ * Its own copy, because the ordinary one would hide the part that matters: the run may still be going
+ * in another dsh process, and deleting the card does not stop it there.
+ * @param t - translate, bound to this plugin's namespace.
+ * @param ref - the card's display number.
+ * @param jobId - the job id the marker names.
+ * @param onConfirm - what confirming does.
+ * @returns the dialog request.
+ */
+export function deleteUnknownRunConfirmation(t: BoardTranslate, ref: number, jobId: string, onConfirm: () => void): ConfirmRequest {
+  const params = { ref, job: jobId }
+  return {
+    title: t('confirm.deleteTitle', params),
+    description: t('confirm.deleteUnknownRun', params),
+    confirmLabel: t('confirm.deleteAction'),
+    onConfirm,
+  }
+}
+
+/**
+ * The confirmation shown before an owner-unknown running marker is cleared.
+ * @param t - translate, bound to this plugin's namespace.
+ * @param ref - the card's display number.
+ * @param jobId - the job id the marker names.
+ * @param onConfirm - what confirming does.
+ * @returns the dialog request.
+ */
+export function clearRunConfirmation(t: BoardTranslate, ref: number, jobId: string, onConfirm: () => void): ConfirmRequest {
+  const params = { ref, job: jobId }
+  return {
+    title: t('confirm.clearRunTitle', params),
+    description: t('confirm.clearRun', params),
+    confirmLabel: t('confirm.clearRunAction'),
+    onConfirm,
+  }
+}
+
+/**
+ * The confirmation shown before a card holding an owner-unknown running marker is dispatched again.
+ * @param t - translate, bound to this plugin's namespace.
+ * @param ref - the card's display number.
+ * @param jobId - the job id the marker names.
+ * @param onConfirm - what confirming does.
+ * @returns the dialog request.
+ */
+export function dispatchUnknownConfirmation(t: BoardTranslate, ref: number, jobId: string, onConfirm: () => void): ConfirmRequest {
+  const params = { ref, job: jobId }
+  return {
+    title: t('confirm.dispatchUnknownTitle', params),
+    description: t('confirm.dispatchUnknown', params),
+    confirmLabel: t('confirm.dispatchUnknownAction'),
+    onConfirm,
+  }
+}
+
+/**
+ * The job id of a card's running marker when that marker records no owner.
+ *
+ * Such a marker is cleared only once the person confirms, and the confirmation carries this id so the
+ * host clears exactly the marker the person was shown.
+ * @param task - the card, when it is loaded.
+ * @returns the job id, or `undefined` for an idle card or a run with a known owner.
+ */
+function unknownRunOf(task: BoardView['tasks'][number] | undefined): string | undefined {
+  return task?.runOwnerUnknown === true ? task.runningJobId : undefined
+}
+
+/**
  * Sort cards the way the board renders them: by column, then by rank inside it.
  *
  * Applied after an optimistic single-card update so a dragged card lands in its new place
@@ -369,24 +438,48 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     })
   }, [mutate, api, sessionId, loadBoard, query, openId, loadDetail])
 
+  /**
+   * A card as this view last read it, from the board or the open detail.
+   * @param taskId - the card.
+   * @returns the card, or `undefined` when neither holds it.
+   */
+  const loadedCard = useCallback((taskId: string): BoardView['tasks'][number] | undefined => (
+    view?.tasks.find(entry => entry.id === taskId) ?? (detail?.task.id === taskId ? detail.task : undefined)
+  ), [view, detail])
+
   const remove = useCallback((taskId: string) => {
-    const target = view?.tasks.find(entry => entry.id === taskId)
-    setConfirming(deleteConfirmation(t, target?.ref, () => {
+    const target = loadedCard(taskId)
+    const unknownRun = unknownRunOf(target)
+    const send = (): void => {
       void mutate(async () => {
-        await api.call('task.delete', { sessionId, taskId })
+        await api.call('task.delete', unknownRun === undefined ? { sessionId, taskId } : { sessionId, taskId, clearUnknownRun: unknownRun })
         if (openId === taskId) setOpenId(undefined)
         await loadBoard(query)
       })
-    }))
-  }, [view, t, mutate, api, sessionId, openId, loadBoard, query])
+    }
+    setConfirming(target !== undefined && unknownRun !== undefined
+      ? deleteUnknownRunConfirmation(t, target.ref, unknownRun, send)
+      : deleteConfirmation(t, target?.ref, send))
+  }, [loadedCard, t, mutate, api, sessionId, openId, loadBoard, query])
 
   const dispatch = useCallback((taskId: string) => {
-    void mutate(async () => {
-      const result = await api.call('task.dispatch', { sessionId, taskId })
-      applyTask(result.task)
-      await loadJobs()
-    })
-  }, [mutate, api, sessionId, applyTask, loadJobs])
+    const target = loadedCard(taskId)
+    const unknownRun = unknownRunOf(target)
+    const send = (): void => {
+      void mutate(async () => {
+        const result = await api.call('task.dispatch', unknownRun === undefined
+          ? { sessionId, taskId }
+          : { sessionId, taskId, clearUnknownRun: unknownRun })
+        applyTask(result.task)
+        await loadJobs()
+      })
+    }
+    if (target === undefined || unknownRun === undefined) {
+      send()
+      return
+    }
+    setConfirming(dispatchUnknownConfirmation(t, target.ref, unknownRun, send))
+  }, [loadedCard, t, mutate, api, sessionId, applyTask, loadJobs])
 
   const comment = useCallback((taskId: string, body: string) => {
     void mutate(async () => {
@@ -414,6 +507,21 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
       await loadJobs()
     })
   }, [mutate, api, sessionId, loadJobs])
+
+  // A card's Stop: a run with a known owner is stopped like any job; a marker with no recorded owner
+  // names no run this board can stop, so the person is asked whether to clear the marker instead.
+  const stopCardRun = useCallback((jobId: string, taskId: string) => {
+    const target = loadedCard(taskId)
+    if (target === undefined || unknownRunOf(target) !== jobId) {
+      jobKill(jobId)
+      return
+    }
+    setConfirming(clearRunConfirmation(t, target.ref, jobId, () => {
+      void mutate(async () => {
+        applyTask(await api.call('task.clearRun', { sessionId, taskId, jobId }))
+      })
+    }))
+  }, [loadedCard, jobKill, t, mutate, api, sessionId, applyTask])
 
   return (
     <>
@@ -445,7 +553,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
           onArchive: archive,
           onDelete: remove,
           onDispatch: dispatch,
-          onStopRun: jobKill,
+          onStopRun: stopCardRun,
         }}
         detailActions={{
           onClose: () => { setOpenId(undefined) },
@@ -462,7 +570,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
           onArchive: archive,
           onDelete: remove,
           onDispatch: dispatch,
-          onStopRun: jobKill,
+          onStopRun: stopCardRun,
           onComment: comment,
           onCommentEdit: (commentId, body) => {
             void mutate(async () => {

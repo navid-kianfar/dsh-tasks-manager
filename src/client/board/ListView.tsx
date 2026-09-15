@@ -75,7 +75,8 @@ export function ListView({
   function menuFor_(task: Task): MenuEntry[] {
     return [
       { id: 'open', label: t('card.open') },
-      ...canDispatch && task.runningJobId === undefined && !task.archived
+      // As on the card: a run with no recorded owner can be replaced, after the view confirms it.
+      ...canDispatch && (task.runningJobId === undefined || task.runOwnerUnknown === true) && !task.archived
         ? [{ id: 'dispatch', label: t('card.dispatch') }]
         : [],
       { type: 'separator', id: 'sep' },
@@ -129,7 +130,7 @@ export function ListView({
                   {task.runningJobId !== undefined && (
                     <span className={css.running}>
                       <IconLoadingOutline16 size={12} className={css.spin} />
-                      {t('card.running')}
+                      {t(task.runOwnerUnknown === true ? 'card.runningOwnerUnknown' : 'card.running')}
                     </span>
                   )}
                   {task.labels.length > 0 && (

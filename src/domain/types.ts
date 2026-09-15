@@ -120,6 +120,13 @@ export interface Task {
    * settles; {@link Task.lastRun} keeps the outcome.
    */
   runningJobId?: string | undefined
+  /**
+   * Set when the running marker does not record which dsh process owns the run — it was written by
+   * an older build of this plugin, or edited by hand. Nothing can tell whether that run is still live
+   * somewhere, so the marker is never cleared automatically; the board shows it as "owner unknown"
+   * and clears it only when a person confirms. Absent on idle cards and on runs with a known owner.
+   */
+  runOwnerUnknown?: true | undefined
   /** The most recent dispatch's outcome, present once a dispatched job has settled. */
   lastRun?: TaskRunSummary | undefined
 }

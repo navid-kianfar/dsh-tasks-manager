@@ -35,16 +35,19 @@ export function TaskCard({
   const [menuOpen, setMenuOpen] = useState(false)
   const due = describeDue(task.dueAt, Date.now(), t)
   const running = task.runningJobId !== undefined
+  // A run with no recorded owner may be long dead, so dispatching again stays on offer; the view
+  // asks the person to confirm replacing that marker first.
+  const ownerUnknown = task.runOwnerUnknown === true
 
   const items: MenuEntry[] = [
     { id: 'open', label: t('card.open') },
-    ...canDispatch && !running && !task.archived
+    ...canDispatch && (!running || ownerUnknown) && !task.archived
       ? [{ id: 'dispatch', label: t('card.dispatch'), icon: <IconPlayOutline16 size={14} /> }]
       : [],
     // A run started from a card must be stoppable from that card: the detail panel is one click
     // further away, and a card that can only be started from here reads as a one-way door.
     ...running
-      ? [{ id: 'stop', label: t('card.stopRun'), icon: <IconStopFill16 size={14} /> }]
+      ? [{ id: 'stop', label: t(ownerUnknown ? 'card.clearRun' : 'card.stopRun'), icon: <IconStopFill16 size={14} /> }]
       : [],
     { type: 'separator', id: 'sep' },
     task.archived
@@ -63,7 +66,7 @@ export function TaskCard({
     setMenuOpen(false)
     if (id === 'open') onOpen(task.id)
     else if (id === 'dispatch') onDispatch(task.id)
-    else if (id === 'stop' && task.runningJobId !== undefined) onStopRun(task.runningJobId)
+    else if (id === 'stop' && task.runningJobId !== undefined) onStopRun(task.runningJobId, task.id)
     else if (id === 'archive') onArchive(task.id, true)
     else if (id === 'restore') onArchive(task.id, false)
     else if (id === 'delete') onDelete(task.id)
@@ -109,7 +112,7 @@ export function TaskCard({
           {running && (
             <span className={css.running}>
               <IconLoadingOutline16 size={12} className={css.spin} />
-              {t('card.running')}
+              {t(ownerUnknown ? 'card.runningOwnerUnknown' : 'card.running')}
             </span>
           )}
           {due !== undefined && <span className={css.due} data-tone={due.tone}>{due.text}</span>}
@@ -123,9 +126,9 @@ export function TaskCard({
           <button
             type="button"
             className={css.stopButton}
-            aria-label={t('card.stopRun')}
-            title={t('card.stopRun')}
-            onClick={() => { onStopRun(task.runningJobId as string) }}
+            aria-label={t(ownerUnknown ? 'card.clearRun' : 'card.stopRun')}
+            title={t(ownerUnknown ? 'card.clearRun' : 'card.stopRun')}
+            onClick={() => { onStopRun(task.runningJobId as string, task.id) }}
           >
             <IconStopFill16 size={12} />
           </button>
