@@ -9,7 +9,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
@@ -117,7 +117,7 @@ describe('ctx.tasks', () => {
 
     expect(created.ref).toBe(1)
     expect(board.read().tasks.map(task => task.title)).toEqual(['through the proxy'])
-    expect(board.databasePath).toBe(join(root, '.dsh', 'tasks.db'))
+    expect(board.databasePath).toBe(join(realpathSync.native(root), '.dsh', 'tasks.db'))
   })
 
   it('roots the board at the marker directory, not the session cwd', async () => {
@@ -126,7 +126,7 @@ describe('ctx.tasks', () => {
     const nested = join(root, 'packages', 'deep')
     mkdirSync(nested, { recursive: true })
 
-    expect(ctx.tasks.boardForCwd(nested).databasePath).toBe(join(root, '.dsh', 'tasks.db'))
+    expect(ctx.tasks.boardForCwd(nested).databasePath).toBe(join(realpathSync.native(root), '.dsh', 'tasks.db'))
   })
 
   it('serves one board per project and reuses the open handle', async () => {

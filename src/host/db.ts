@@ -14,8 +14,8 @@
  */
 
 import { DatabaseSync } from 'node:sqlite'
-import { mkdirSync, openSync, closeSync } from 'node:fs'
-import { dirname, isAbsolute, resolve } from 'node:path'
+import { closeSync, existsSync, mkdirSync, openSync, realpathSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 
 /**
  * The on-disk layout version, stamped into `PRAGMA user_version`.
@@ -54,6 +54,23 @@ export class TaskStoreError extends Error {
  */
 export function resolveDatabasePath(projectRoot: string, configured: string): string {
   return isAbsolute(configured) ? resolve(configured) : resolve(projectRoot, configured)
+}
+
+/**
+ * The one spelling of a board path that every route to the same file agrees on.
+ *
+ * Symlinks and — on a case-insensitive volume such as a default macOS disk — letter case name one
+ * file under several strings, and a registry keyed on the raw string would open it twice. The
+ * directory is created so it can be resolved; the file itself is resolved once it exists.
+ * @param path - absolute database path, or `:memory:`.
+ * @returns the canonical path, or `:memory:` unchanged.
+ */
+export function canonicalDatabasePath(path: string): string {
+  if (path === ':memory:') return path
+  const absolute = resolve(path)
+  mkdirSync(dirname(absolute), { recursive: true, mode: 0o700 })
+  if (existsSync(absolute)) return realpathSync.native(absolute)
+  return join(realpathSync.native(dirname(absolute)), basename(absolute))
 }
 
 /**

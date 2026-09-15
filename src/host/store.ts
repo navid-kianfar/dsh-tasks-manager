@@ -48,7 +48,7 @@ import {
   parseTimestamp,
   parseTitle,
 } from '../domain/validate.ts'
-import { openBoardDatabase, resolveDatabasePath, type JournalMode } from './db.ts'
+import { canonicalDatabasePath, openBoardDatabase, resolveDatabasePath, type JournalMode } from './db.ts'
 
 /** Raised when a caller addresses a card or comment that is not in this board. */
 export class TaskNotFoundError extends Error {
@@ -305,10 +305,24 @@ export class TaskStore {
     this.#db = openBoardDatabase(databasePath, options.journalMode, options.busyTimeoutMs)
   }
 
-  /** Release the database handle. Idempotent, so teardown can call it without checking. */
+  /**
+   * Release the database handle. Idempotent, so teardown can call it without checking.
+   *
+   * Under WAL the newest writes live in `tasks.db-wal` until a checkpoint moves them into the main
+   * file. Checkpointing here means that once dsh has stopped, `tasks.db` alone is the whole board —
+   * so copying or committing that one file, as a hand query invites, does not yield a board that
+   * looks corrupted or rolled back.
+   */
   close(): void {
     this.#statements.clear()
-    if (this.#db.isOpen) this.#db.close()
+    if (!this.#db.isOpen) return
+    try {
+      if (this.#options.journalMode === 'wal') this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    } catch {
+      // A checkpoint blocked by another reader is harmless: the WAL is still valid and the next
+      // close or open folds it in. Closing must not fail because of it.
+    }
+    this.#db.close()
   }
 
   /**
@@ -952,9 +966,28 @@ function formatDue(value: number | null): string | undefined {
 }
 
 /**
- * One open board per project root, for the process's lifetime.
+ * Boards whose stranded run markers this process has already swept.
  *
- * Boards are keyed by the resolved project root rather than opened per call: SQLite handles are
+ * Process-wide, so a settings rebuild, a plugin reload, or a second copy of this module does not
+ * sweep again. A second sweep would clear the markers of runs this very process started and is
+ * still running, and the board would call live work "interrupted".
+ */
+const SWEPT_KEY = Symbol.for('@achasoft/dsh-tasks-manager/swept-boards')
+
+/**
+ * The sweep table.
+ * @returns the set of canonical board paths already swept, created on first use.
+ */
+function sweptBoards(): Set<string> {
+  const holder = globalThis as { [SWEPT_KEY]?: Set<string> }
+  holder[SWEPT_KEY] ??= new Set()
+  return holder[SWEPT_KEY]
+}
+
+/**
+ * One open board per database file, for the process's lifetime.
+ *
+ * Boards are keyed by the canonical database path rather than opened per call: SQLite handles are
  * cheap to keep and expensive to churn, and two handles on one WAL database in one process would
  * contend with each other for no benefit.
  */
@@ -979,11 +1012,15 @@ export class TaskStoreRegistry {
    * @returns the project's board.
    */
   open(projectRoot: string, now: number): TaskStore {
-    const path = resolveDatabasePath(projectRoot, this.#databasePath)
+    const path = canonicalDatabasePath(resolveDatabasePath(projectRoot, this.#databasePath))
     let store = this.#stores.get(path)
     if (store === undefined) {
       store = new TaskStore(path, this.#options)
-      store.clearStaleRuns(now)
+      const swept = sweptBoards()
+      if (path === ':memory:' || !swept.has(path)) {
+        store.clearStaleRuns(now)
+        swept.add(path)
+      }
       this.#stores.set(path, store)
     }
     return store
