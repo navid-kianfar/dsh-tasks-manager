@@ -1,6 +1,6 @@
 {
   "name": "@achasoft/dsh-tasks-manager",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Task management for the DeepSeek Harness: the session todo list, a project task board backed by a queryable SQLite database, and board cards dispatched to the agent as background jobs",
   "license": "MIT",
   "type": "module",
