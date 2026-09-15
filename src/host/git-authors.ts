@@ -66,14 +66,40 @@ export interface GitAuthorDirectoryResult {
 const UNAVAILABLE: GitAuthorDirectoryResult = Object.freeze({ authors: [], available: false })
 
 /**
+ * Configuration overrides that keep a read from running anything the repository names.
+ *
+ * The project directory is untrusted input — a fresh clone, an extracted archive, whatever a session
+ * was opened in — and its `.git/config` may name programs git will execute on an ordinary read. The
+ * Tasks view reads authors automatically when it opens, so a hostile repository must not be able to
+ * turn "open the board" into "run my script". `-c` on the command line outranks every config file.
+ *
+ * - `log.showSignature=false`: with it `true`, `git log` runs `gpg.program` (or `gpg.ssh.program`)
+ *   on every signed commit, whatever `--format` asks for. Reproduced on git 2.50.1.
+ * - `core.fsmonitor=false`: a path here is a hook git runs whenever it consults the index. `log`
+ *   and `config` do not today, but the override costs nothing and survives a future git that does.
+ * - `core.pager=cat`: belt and braces — a pager only starts on a terminal, and this read has none.
+ *
+ * What is left is not executable: `include.path` pulls in more config files (whose values these
+ * overrides still outrank), and `mailmap.file` is read, not run. Diff drivers and textconv only run
+ * when a diff is produced, which `--format` without `-p` never does.
+ */
+const SAFE_CONFIG = [
+  '-c', 'log.showSignature=false',
+  '-c', 'core.fsmonitor=false',
+  '-c', 'core.pager=cat',
+] as const
+
+/**
  * Run one git command in a project, returning its stdout.
+ *
+ * Every invocation goes through {@link SAFE_CONFIG} and `--no-pager`, so no caller can forget them.
  * @param root - the repository's working directory.
- * @param args - arguments after `-C <root>`.
+ * @param args - arguments after the global options.
  * @returns stdout, or `undefined` when git failed for any reason.
  */
 async function git(root: string, args: readonly string[]): Promise<string | undefined> {
   try {
-    const { stdout } = await run('git', ['-C', root, ...args], {
+    const { stdout } = await run('git', ['--no-pager', ...SAFE_CONFIG, '-C', root, ...args], {
       timeout: GIT_TIMEOUT_MS,
       maxBuffer: GIT_MAX_BUFFER,
       windowsHide: true,
@@ -191,7 +217,14 @@ export class GitAuthorDirectory {
    * @returns the authors, or an unavailable result.
    */
   private async load(root: string): Promise<GitAuthorDirectoryResult> {
-    const log = await git(root, ['log', `--max-count=${COMMIT_SCAN_LIMIT}`, `--format=%an${FIELD}%ae`])
+    // `--no-show-signature` as well as the config override: the flag states the intent at the call
+    // site, and the override covers the config-file route the flag was added alongside.
+    const log = await git(root, [
+      'log',
+      '--no-show-signature',
+      `--max-count=${COMMIT_SCAN_LIMIT}`,
+      `--format=%an${FIELD}%ae`,
+    ])
     // A repository with no commits yet answers with empty output rather than failing, so `undefined`
     // is the only signal that git itself could not be reached.
     if (log === undefined) return UNAVAILABLE

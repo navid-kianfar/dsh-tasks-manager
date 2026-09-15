@@ -53,7 +53,10 @@ export interface BoardReadRequest extends SessionScoped {
  * when the revision actually moved.
  */
 export interface BoardRevisionResult {
-  /** Monotonic counter bumped by every write through this plugin. */
+  /**
+   * Change counter, advanced by database triggers on every write to a card or comment — by this
+   * plugin, another process, or `sqlite3`. Compare it for equality; the size of a step means nothing.
+   */
   revision: number
   /** Live active-card count per column. */
   counts: Record<TaskStatus, number>
@@ -79,6 +82,12 @@ export interface TaskUpdateRequest extends SessionScoped {
   taskId: string
   /** The fields to change; absent keys are left alone. */
   patch: TaskPatch
+  /**
+   * The card's `updatedAt` as the caller last read it. When sent, the update is refused with a
+   * `bad-request` saying the card changed if anyone has changed it since, instead of silently
+   * overwriting their edit. Optional, so an older client still updates unconditionally.
+   */
+  expectedUpdatedAt?: number
 }
 
 /** `task.move` — the drag-and-drop path: a new column and a position within it. */
@@ -164,7 +173,7 @@ export interface JobView {
   taskId?: string
 }
 
-/** `jobs.read` — consume a job's output since the last read. */
+/** `jobs.read` — a job's state, and its final output when reading it takes nothing from the agent. */
 export interface JobReadRequest extends SessionScoped {
   /** The job to read. */
   jobId: string
@@ -172,10 +181,19 @@ export interface JobReadRequest extends SessionScoped {
 
 /** What a job read returned. */
 export interface JobReadResult {
-  /** Output produced since the previous read; the final output once the job has settled. */
+  /**
+   * The job's final output once it has settled, for a card run. Empty while it runs, and always
+   * empty when {@link outputWithheld} is set.
+   */
   text: string
   /** The job's state at read time. */
   job: JobView
+  /**
+   * Set for a job whose output is a stream with one consuming cursor — a shell command, a
+   * subagent the model started. That cursor is the agent's (`job_output`), so the board does not
+   * read it: doing so would take the output from the agent. Absent for this plugin's own card runs.
+   */
+  outputWithheld?: boolean
 }
 
 /** `jobs.kill` — ask a job to stop. */

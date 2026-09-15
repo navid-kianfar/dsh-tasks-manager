@@ -5,8 +5,10 @@
  * that hid the shell command running in the same session would be lying about what is running, so
  * it lists `bash` and `subagent` jobs beside this plugin's own and labels each with its kind.
  *
- * Output is read on demand rather than streamed: the registry's read is a consuming cursor, so
- * polling it in the background would silently eat the deltas the agent itself is waiting to read.
+ * Output is read on demand rather than streamed, and only for the board's own card runs, whose final
+ * output the registry returns without consuming anything. Every other job's output sits behind one
+ * consuming cursor that belongs to the agent (`job_output`); the host withholds it, and the panel
+ * says so instead of taking it.
  *
  * @module @achasoft/dsh-tasks-manager/client/board/Background
  */

@@ -1,7 +1,19 @@
 /** The board store against a real in-memory SQLite database: lifecycle, ordering, and history. */
 
 import { afterEach, describe, expect, it } from 'vitest'
-import { TaskStore, TaskNotFoundError, type TaskStoreOptions } from '../../src/host/store.ts'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
+import {
+  TaskConflictError,
+  TaskStore,
+  TaskNotFoundError,
+  judgeRunByProcess,
+  type TaskStoreOptions,
+} from '../../src/host/store.ts'
+import { currentRunOwner, type RunOwner } from '../../src/host/run-owner.ts'
 import { TaskValidationError } from '../../src/domain/validate.ts'
 import type { Task, TaskStatus } from '../../src/domain/types.ts'
 
@@ -142,6 +154,31 @@ describe('ordering', () => {
     const placed = store.update(b.id, { place: { after: a.id } }, { actor: 'user' }, tick())
     expect(placed.id).toBe(b.id)
     expect(store.read().tasks).toHaveLength(1)
+  })
+
+  it('ignores a named neighbour that now sits in another column', () => {
+    const store = board({ newTaskPlacement: 'bottom' })
+    store.create({ title: 'a', status: 'todo' }, { actor: 'user' }, tick())
+    store.create({ title: 'b', status: 'todo' }, { actor: 'user' }, tick())
+    const c = store.create({ title: 'c', status: 'todo' }, { actor: 'user' }, tick())
+    // Another writer moved the neighbour to the backlog between the drag and the drop.
+    const elsewhere = store.create({ title: 'elsewhere', status: 'backlog' }, { actor: 'user' }, tick())
+
+    store.update(c.id, { place: { before: elsewhere.id } }, { actor: 'user' }, tick())
+
+    // Its rank orders a different column; landing "before" it would have put c at the top of todo.
+    expect(store.read({ status: ['todo'] }).tasks.map(task => task.title)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('lands directly below a neighbour named alone, not past the cards that follow it', () => {
+    const store = board({ newTaskPlacement: 'bottom' })
+    const a = store.create({ title: 'a' }, { actor: 'user' }, tick())
+    store.create({ title: 'b' }, { actor: 'user' }, tick())
+    const c = store.create({ title: 'c' }, { actor: 'user' }, tick())
+
+    store.update(c.id, { place: { after: a.id } }, { actor: 'user' }, tick())
+
+    expect(store.read().tasks.map(task => task.title)).toEqual(['a', 'c', 'b'])
   })
 
   it('keeps every column independently ordered', () => {
@@ -355,6 +392,18 @@ describe('query', () => {
     expect(view.counts).toEqual({ backlog: 0, todo: 1, in_progress: 1, blocked: 0, done: 1 })
   })
 
+  it('keeps outstanding work when a limit cuts the read', () => {
+    const store = board()
+    for (let index = 0; index < 3; index++) store.create({ title: `done ${index}`, status: 'done' }, { actor: 'user' }, tick())
+    store.create({ title: 'doing', status: 'in_progress' }, { actor: 'user' }, tick())
+    store.create({ title: 'next', status: 'todo' }, { actor: 'user' }, tick())
+    store.create({ title: 'stuck', status: 'blocked' }, { actor: 'user' }, tick())
+
+    // Alphabetically `blocked, done, in_progress, todo`: a cut at three returned finished work and
+    // hid what is being worked on.
+    expect(store.read({ limit: 3 }).tasks.map(task => task.status)).toEqual(['todo', 'in_progress', 'blocked'])
+  })
+
   it('caps a read at the requested limit', () => {
     const store = board()
     for (let index = 0; index < 10; index++) {
@@ -369,44 +418,178 @@ describe('runs', () => {
   it('marks a card running and records how the run ended', () => {
     const store = board()
     const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
-    const running = store.startRun(task.id, 'task-1', { actor: 'user', sessionId: 's1' }, tick())
+    const owner = currentRunOwner('s1')
+    const running = store.startRun(task.id, 'task-1', owner, { actor: 'user', sessionId: 's1' }, tick())
     expect(running.runningJobId).toBe('task-1')
+    expect(store.runMarker(task.id)).toEqual({ taskId: task.id, ref: task.ref, jobId: 'task-1', owner })
 
     const finished = store.finishRun(
       task.id,
       { jobId: 'task-1', status: 'completed', detail: 'exit 0', startedAt: 1, finishedAt: 2 },
+      owner,
       { actor: 'system' },
       tick(),
+      { report: 'did the thing', completedStatus: 'done' },
     )
-    expect(finished?.runningJobId).toBeUndefined()
-    expect(finished?.lastRun).toEqual({
+    expect(finished?.current).toBe(true)
+    expect(finished?.task.runningJobId).toBeUndefined()
+    expect(finished?.task.status).toBe('done')
+    expect(finished?.task.lastRun).toEqual({
       jobId: 'task-1', status: 'completed', detail: 'exit 0', startedAt: 1, finishedAt: 2,
     })
+    expect(store.runMarker(task.id)).toBeUndefined()
+    expect(store.detail(task.id).comments.map(comment => comment.body)).toEqual(['did the thing'])
     expect(store.detail(task.id).activity.map(entry => entry.kind))
-      .toEqual(['created', 'run-started', 'run-finished'])
+      .toEqual(['created', 'run-started', 'run-finished', 'comment', 'status'])
+  })
+
+  it('refuses a second run on a card that already has one', () => {
+    const store = board()
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    store.startRun(task.id, 'task-1', currentRunOwner('s1'), { actor: 'user' }, tick())
+    expect(() => store.startRun(task.id, 'task-2', currentRunOwner('s1'), { actor: 'user' }, tick()))
+      .toThrow(/already running as job task-1/u)
+  })
+
+  it('does not let another process\'s settlement of the same job id clear this run', () => {
+    const store = board()
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    // Job ids are per-process counters: process A and process B both have a `task-1`.
+    const mine = currentRunOwner('s1')
+    store.startRun(task.id, 'task-1', mine, { actor: 'user' }, tick())
+    const elsewhere = { ...mine, instance: 'another-process', pid: mine.pid + 1 }
+
+    const settled = store.finishRun(
+      task.id,
+      { jobId: 'task-1', status: 'failed', startedAt: 1, finishedAt: 2 },
+      elsewhere,
+      { actor: 'system' },
+      tick(),
+      { completedStatus: 'done' },
+    )
+
+    expect(settled?.current).toBe(false)
+    expect(settled?.task.runningJobId).toBe('task-1')
+    expect(settled?.task.status).toBe('backlog')
+    expect(settled?.task.lastRun).toBeUndefined()
+  })
+
+  it('keeps a late settlement\'s outcome when the marker was already swept', () => {
+    const store = board()
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    const owner = currentRunOwner('s1')
+    store.startRun(task.id, 'task-1', owner, { actor: 'user' }, tick())
+    store.reconcileRuns(() => ({ kind: 'interrupted' }), tick())
+
+    const settled = store.finishRun(
+      task.id,
+      { jobId: 'task-1', status: 'completed', startedAt: 1, finishedAt: 2 },
+      owner,
+      { actor: 'system' },
+      tick(),
+      { completedStatus: 'done' },
+    )
+
+    expect(settled?.current).toBe(false)
+    expect(settled?.task.lastRun?.status).toBe('completed')
+    // The automatic move belongs to a current run only.
+    expect(settled?.task.status).toBe('backlog')
   })
 
   it('tolerates a card deleted while its run was live', () => {
     const store = board()
     const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
-    store.startRun(task.id, 'task-1', { actor: 'user' }, tick())
+    const owner = currentRunOwner('s1')
+    store.startRun(task.id, 'task-1', owner, { actor: 'user' }, tick())
     store.remove(task.id)
     const settled = store.finishRun(
       task.id,
       { jobId: 'task-1', status: 'killed', startedAt: 1, finishedAt: 2 },
+      owner,
       { actor: 'system' },
       tick(),
     )
     expect(settled).toBeUndefined()
   })
 
-  it('clears markers stranded by a previous process', () => {
+  it('records a settled verdict from the sweep as the run\'s outcome', () => {
     const store = board()
     const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
-    store.startRun(task.id, 'task-1', { actor: 'user' }, tick())
-    expect(store.clearStaleRuns(tick())).toBe(1)
-    expect(store.detail(task.id).task.runningJobId).toBeUndefined()
-    expect(store.clearStaleRuns(tick())).toBe(0)
+    store.startRun(task.id, 'task-1', currentRunOwner('s1'), { actor: 'user' }, tick())
+    const summary = { jobId: 'task-1', status: 'failed', detail: 'boom', startedAt: 1, finishedAt: 2 } as const
+
+    expect(store.reconcileRuns(() => ({ kind: 'settled', summary }), tick())).toBe(1)
+
+    expect(store.detail(task.id).task.lastRun).toEqual(summary)
+    expect(store.detail(task.id).activity.at(-1)).toMatchObject({ kind: 'run-finished', from: 'task-1', to: 'failed' })
+  })
+})
+
+describe('the stale-run sweep, judged by owner process', () => {
+  const children: ChildProcess[] = []
+
+  afterEach(() => {
+    for (const child of children.splice(0)) child.kill('SIGKILL')
+  })
+
+  /**
+   * A real second process, standing in for another dsh on the same board.
+   * @returns the running child.
+   */
+  async function otherProcess(): Promise<ChildProcess> {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' })
+    children.push(child)
+    await new Promise<void>((resolve) => { child.once('spawn', () => { resolve() }) })
+    return child
+  }
+
+  /**
+   * A board with one card whose run is owned as described.
+   * @param owner - the owner to record.
+   * @returns the store and the card id.
+   */
+  function markedBoard(owner: RunOwner): { store: TaskStore; taskId: string } {
+    const store = board()
+    const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+    store.startRun(task.id, 'task-1', owner, { actor: 'user' }, tick())
+    return { store, taskId: task.id }
+  }
+
+  it('leaves a run owned by a live process on this host alone', async () => {
+    const child = await otherProcess()
+    const { store, taskId } = markedBoard({ ...currentRunOwner('s1'), pid: child.pid as number, instance: 'b' })
+
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
+    expect(store.detail(taskId).task.runningJobId).toBe('task-1')
+  })
+
+  it('clears a run whose owner process has exited', async () => {
+    const child = await otherProcess()
+    const pid = child.pid as number
+    const { store, taskId } = markedBoard({ ...currentRunOwner('s1'), pid, instance: 'b' })
+    const exited = new Promise<void>((resolve) => { child.once('exit', () => { resolve() }) })
+    child.kill('SIGKILL')
+    await exited
+
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(1)
+    expect(store.detail(taskId).task.runningJobId).toBeUndefined()
+    expect(store.detail(taskId).activity.at(-1)).toMatchObject({ kind: 'run-finished', to: 'interrupted' })
+  })
+
+  it('leaves this process\'s own run for the job registry to judge', () => {
+    const { store, taskId } = markedBoard(currentRunOwner('s1'))
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
+    expect(store.detail(taskId).task.runningJobId).toBe('task-1')
+  })
+
+  it('treats an earlier holder of this process\'s pid as gone', () => {
+    const { store } = markedBoard({ ...currentRunOwner('s1'), instance: 'a-previous-process' })
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(1)
+  })
+
+  it('never sweeps a run owned on another host, whose processes it cannot probe', () => {
+    const { store } = markedBoard({ ...currentRunOwner('s1'), host: 'some-other-host', pid: 1, instance: 'x' })
+    expect(store.reconcileRuns(judgeRunByProcess, tick())).toBe(0)
   })
 })
 
@@ -421,6 +604,94 @@ describe('revision', () => {
     store.read()
     store.detail(task.id)
     expect(store.revision()).toBe(2)
+  })
+
+  it('moves when another connection edits the file, as `sqlite3` would', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'dsh-tasks-revision-'))
+    const path = join(directory, 'tasks.db')
+    const store = new TaskStore(path, OPTIONS)
+    const outside = new DatabaseSync(path)
+    try {
+      const task = store.create({ title: 'card' }, { actor: 'user' }, tick())
+      const before = store.revision()
+
+      outside.prepare("UPDATE tasks SET status = 'done' WHERE id = ?").run(task.id)
+      const afterEdit = store.revision()
+      expect(afterEdit).not.toBe(before)
+
+      outside.prepare('INSERT INTO comments (id, task_id, body, author, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run('c_0000000000000000000001', task.id, 'by hand', 'user', 1, 1)
+      expect(store.revision()).not.toBe(afterEdit)
+      expect(store.detail(task.id).task.status).toBe('done')
+    } finally {
+      outside.close()
+      store.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('optimistic concurrency', () => {
+  it('refuses an edit made against a card someone else has changed since', () => {
+    const store = board()
+    const task = store.create({ title: 'original' }, { actor: 'user' }, tick())
+    store.update(task.id, { title: 'changed by the agent' }, { actor: 'agent' }, tick())
+
+    expect(() => store.update(task.id, { title: 'my edit' }, { actor: 'user' }, tick(), task.updatedAt))
+      .toThrow(TaskConflictError)
+    expect(store.detail(task.id).task.title).toBe('changed by the agent')
+  })
+
+  it('applies an edit whose expected stamp is current', () => {
+    const store = board()
+    const task = store.create({ title: 'original' }, { actor: 'user' }, tick())
+    expect(store.update(task.id, { title: 'mine' }, { actor: 'user' }, tick(), task.updatedAt).title).toBe('mine')
+  })
+})
+
+describe('createMany', () => {
+  it('keeps the given order with top placement', () => {
+    const store = board({ newTaskPlacement: 'top' })
+    store.create({ title: 'already there' }, { actor: 'user' }, tick())
+    store.createMany([{ title: 'a' }, { title: 'b' }, { title: 'c' }], { actor: 'agent' }, tick())
+    expect(store.read().tasks.map(task => task.title)).toEqual(['a', 'b', 'c', 'already there'])
+  })
+
+  it('keeps the given order with bottom placement, per column', () => {
+    const store = board({ newTaskPlacement: 'bottom' })
+    store.create({ title: 'already there' }, { actor: 'user' }, tick())
+    store.createMany(
+      [{ title: 'a' }, { title: 'x', status: 'todo' }, { title: 'b' }, { title: 'y', status: 'todo' }],
+      { actor: 'agent' },
+      tick(),
+    )
+    expect(store.read().tasks.map(task => task.title)).toEqual(['already there', 'a', 'b', 'x', 'y'])
+  })
+
+  it('writes nothing when any card in the batch is invalid', () => {
+    const store = board()
+    expect(() => store.createMany([{ title: 'fine' }, { title: '   ' }], { actor: 'agent' }, tick()))
+      .toThrow(TaskValidationError)
+    expect(store.read().tasks).toEqual([])
+    expect(store.revision()).toBe(0)
+  })
+})
+
+describe('commentCounts', () => {
+  it('counts every requested card\'s comments in one read', () => {
+    const store = board()
+    const a = store.create({ title: 'a' }, { actor: 'user' }, tick())
+    const b = store.create({ title: 'b' }, { actor: 'user' }, tick())
+    const c = store.create({ title: 'c' }, { actor: 'user' }, tick())
+    store.addComment(a.id, 'one', { actor: 'user' }, tick())
+    store.addComment(a.id, 'two', { actor: 'user' }, tick())
+    store.addComment(b.id, 'three', { actor: 'user' }, tick())
+
+    const counts = store.commentCounts([a.id, b.id, c.id])
+    expect(counts.get(a.id)).toBe(2)
+    expect(counts.get(b.id)).toBe(1)
+    expect(counts.get(c.id)).toBeUndefined()
+    expect(store.commentCounts([]).size).toBe(0)
   })
 })
 

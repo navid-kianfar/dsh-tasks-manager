@@ -11,7 +11,8 @@
  * `KNOWN_SESSION_EVENT_TYPES`, and `Session.append` has no way to mark one ignorable. Board state
  * therefore lives only in SQLite, and the browser learns about changes by polling the cheap
  * `board.revision` endpoint — which also covers the changes a session log never could: another
- * session's writes, and a person editing `.dsh/tasks.db` with `sqlite3`.
+ * session's writes, and a person editing `.dsh/tasks.db` with `sqlite3`. The revision is advanced by
+ * triggers in the database itself, which is what makes that last promise true.
  *
  * @module @achasoft/dsh-tasks-manager/host
  */
@@ -20,9 +21,8 @@ import { Context, Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { installSettingsSection, settingsNamespace } from './settings-section.ts'
 import type { RpcError, RpcResult } from '@deepseek-ai/dsh-host-apiproxy/api'
-import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionId, SessionStore } from '@deepseek-ai/dsh-session'
-import type { JobOutcome, JobSnapshot } from '@deepseek-ai/dsh-jobs'
+import type { JobSnapshot } from '@deepseek-ai/dsh-jobs'
 import type {} from '@deepseek-ai/dsh-jobs'
 import type {} from '@deepseek-ai/dsh-subagent'
 import type {} from '@deepseek-ai/dsh-client-connection'
@@ -35,10 +35,21 @@ import {
   type TaskCreate,
   type TaskDetail,
   type TaskPatch,
+  type TaskRunSummary,
   type TaskStatus,
 } from '../domain/types.ts'
-import { TaskValidationError, parseCommentIdText, parseTaskId } from '../domain/validate.ts'
-import { TaskNotFoundError, TaskStoreRegistry, type TaskAuthor, type TaskStore } from './store.ts'
+import { MAX_COMMENT_LENGTH, TaskValidationError, parseCommentIdText, parseTaskId } from '../domain/validate.ts'
+import {
+  TaskConflictError,
+  TaskNotFoundError,
+  TaskStoreRegistry,
+  judgeRunByProcess,
+  type RunMarker,
+  type RunVerdict,
+  type TaskAuthor,
+  type TaskStore,
+} from './store.ts'
+import { currentRunOwner, ownerProcessState, type RunOwner } from './run-owner.ts'
 import { DEFAULT_DATABASE_PATH, JOURNAL_MODES, TaskStoreError, type JournalMode } from './db.ts'
 import { projectRootFor } from './project-root.ts'
 import { mountChannel } from './channel.ts'
@@ -58,7 +69,7 @@ export type * from './protocol.ts'
 export type { GitAuthor, GitAuthorDirectoryResult } from './git-authors.ts'
 export { GitAuthorDirectory } from './git-authors.ts'
 export type { TaskAuthor, TaskStore } from './store.ts'
-export { TaskNotFoundError } from './store.ts'
+export { TaskConflictError, TaskNotFoundError } from './store.ts'
 
 /** The settings namespace both halves address; the browser card joins the section on it. */
 export const TASKS_SETTINGS_NAMESPACE = settingsNamespace('tasks')
@@ -155,7 +166,9 @@ function badRequest(message: string): { ok: false; error: RpcError } {
  * @returns the error branch.
  */
 function toRpcError(error: unknown): { ok: false; error: RpcError } {
-  if (error instanceof TaskValidationError || error instanceof TaskNotFoundError) {
+  // A conflict is `bad-request` too: the board already re-reads itself on that code, which is exactly
+  // the recovery a stale edit needs, and the message says the change was not applied.
+  if (error instanceof TaskValidationError || error instanceof TaskNotFoundError || error instanceof TaskConflictError) {
     return badRequest(error.message)
   }
   if (error instanceof TaskStoreError) {
@@ -172,17 +185,75 @@ function toRpcError(error: unknown): { ok: false; error: RpcError } {
 }
 
 /**
+ * One stored session as `@deepseek-ai/dsh-session-persistence` reports it (`SessionPersistenceSnapshot`
+ * on 0.1.5-rc.2): the header is nested under `header`, not spread onto the snapshot.
+ */
+interface PersistedSessionSnapshot {
+  /** The session's immutable header; the board reads only `id` and `cwd`. */
+  readonly header: { readonly id: string; readonly cwd?: string | undefined }
+}
+
+/**
  * The persisted-session lookup this plugin borrows, declared structurally.
  *
  * `@deepseek-ai/dsh-session-persistence` is not a dependency of this package and should not become
  * one: the board needs exactly one field off one call, and a deployment composing no persistence
- * backend must still serve live sessions. `ctx.get` answers `undefined` there, and the widest thing
- * this plugin ever touches is `cwd`.
+ * backend must still serve live sessions. `ctx.get` answers `undefined` there.
+ *
+ * `stat` is preferred: it reads one session's metadata, where `list` walks every session directory
+ * on disk and reads each generation header. It is optional here only so a backend without it still
+ * resolves sessions through `list`.
  */
 interface PersistedSessions {
-  /** Every materialized session's header, from metadata alone — no log is parsed. */
-  list(signal?: AbortSignal): Promise<readonly { id: string; cwd?: string | undefined }[]>
+  /** One stored session's metadata, without reading its log; `undefined` when it does not exist. */
+  stat?(id: string, options?: { signal?: AbortSignal }): Promise<PersistedSessionSnapshot | undefined>
+  /** Every stored session's metadata. */
+  list(options?: { signal?: AbortSignal }): Promise<readonly PersistedSessionSnapshot[]>
 }
+
+/**
+ * How long a session persistence could not resolve is left alone before it is looked up again.
+ *
+ * The board polls every two seconds. Without a backoff, a tab open on a session that is neither live
+ * nor on disk would hit persistence on every tick for as long as it stays open.
+ */
+const SESSION_MISS_BACKOFF_MS = 30_000
+
+/** Most unresolved session ids remembered at once; the oldest is forgotten first. */
+const MAX_REMEMBERED_MISSES = 512
+
+/** Longest session id handed to persistence; anything longer names no session this harness mints. */
+const MAX_SESSION_ID_LENGTH = 256
+
+/**
+ * How long one `jobs.wait` slice holds a dispatched run's completion notice.
+ *
+ * A wait needs a finite bound, so the hold re-arms in slices. Long enough that re-arming is rare,
+ * and well below the 2^31-1 ms ceiling a Node timer accepts.
+ */
+const NOTICE_HOLD_SLICE_MS = 6 * 60 * 60 * 1000
+
+/** Job statuses after which a job never changes again. */
+const TERMINAL_JOB_STATUSES: ReadonlySet<string> = new Set(['completed', 'killed', 'failed'])
+
+/** The reason recorded on a run stopped because its card was deleted. */
+const DELETED_CARD_REASON = 'the card it was working was deleted from the task board'
+
+/** The reason recorded on a run stopped from the board. */
+const STOPPED_FROM_BOARD_REASON = 'stopped from the task board'
+
+/** The job registry as this plugin reaches it. */
+type JobRegistryFace = Context['jobs']
+
+/**
+ * A live agent, typed as the job registry receives it.
+ *
+ * Every agent this plugin touches is handed to `ctx.jobs`, so its type is taken from there. The
+ * development checkout this package links for types can lag the installed harness, and the two
+ * copies of the agent type are then nominally distinct though the runtime object is one; deriving it
+ * from the registry keeps that split to the one line that crosses to the subagent seam.
+ */
+type Agent = NonNullable<Parameters<JobRegistryFace['list']>[0]>
 
 /** Raised when a request names a session this process cannot resolve a project for. */
 class SessionUnavailableError extends Error {
@@ -286,6 +357,12 @@ export class TasksService extends Service {
    * re-reading persistence on every tick after a restart.
    */
   private readonly sessionCwd = new Map<string, string>()
+  /** Session ids persistence could not resolve, with the epoch ms before which not to ask again. */
+  private readonly sessionMisses = new Map<string, number>()
+  /** Persistence lookups already running, so a burst of polls for one session shares one read. */
+  private readonly sessionLookups = new Map<string, Promise<string | undefined>>()
+  /** Aborts every held completion notice when the service goes away; see `holdCompletionNotice`. */
+  private readonly noticeHolds = new AbortController()
 
   /**
    * @param ctx - host context.
@@ -306,7 +383,10 @@ export class TasksService extends Service {
     // the tools and the database still work there.
     mountChannel(ctx, TASKS_RPC_CHANNEL, (endpoint, payload, signal) => this.routeRpc(endpoint, payload, signal))
 
-    ctx.effect(() => () => { this.registry.close() }, 'dsh-tasks: close boards')
+    ctx.effect(() => () => {
+      this.noticeHolds.abort('the task service was disposed')
+      this.registry.close()
+    }, 'dsh-tasks: close boards')
   }
 
   /**
@@ -315,12 +395,16 @@ export class TasksService extends Service {
    * @returns the registry.
    */
   private buildRegistry(config: Config): TaskStoreRegistry {
-    return new TaskStoreRegistry(config.databasePath, {
-      newTaskPlacement: config.newTaskPlacement,
-      defaultStatus: config.defaultStatus,
-      journalMode: config.journalMode,
-      busyTimeoutMs: config.busyTimeoutMs,
-    })
+    return new TaskStoreRegistry(
+      config.databasePath,
+      {
+        newTaskPlacement: config.newTaskPlacement,
+        defaultStatus: config.defaultStatus,
+        journalMode: config.journalMode,
+        busyTimeoutMs: config.busyTimeoutMs,
+      },
+      marker => this.judgeRun(marker),
+    )
   }
 
   /**
@@ -328,6 +412,9 @@ export class TasksService extends Service {
    *
    * Closing and rebuilding rather than mutating in place because `databasePath` and `journalMode`
    * are decided when a database is opened; a live handle cannot adopt a new value for either.
+   *
+   * A run dispatched before the rebuild still settles: settlement addresses its board by path through
+   * `TaskStoreRegistry.withBoardAt`, which does not need the board to be open.
    */
   private rebuild(): void {
     this.registry.close()
@@ -397,24 +484,72 @@ export class TasksService extends Service {
     const live = sessions?.get(sessionId as SessionId)
     if (live !== undefined) return live.header.cwd
 
+    // A session's `cwd` is fixed at creation, so a resolved entry never goes stale.
     const cached = this.sessionCwd.get(sessionId)
     if (cached !== undefined) return cached
 
     const persistence = this.ctx.get('sessionPersistence') as PersistedSessions | undefined
-    if (persistence === undefined) return undefined
+    if (persistence === undefined || sessionId.length > MAX_SESSION_ID_LENGTH) return undefined
+    const retryAt = this.sessionMisses.get(sessionId)
+    if (retryAt !== undefined && Date.now() < retryAt) return undefined
+
+    const pending = this.sessionLookups.get(sessionId)
+    if (pending !== undefined) return pending
+    const lookup = this.lookUpPersistedCwd(persistence, sessionId)
+      .finally(() => { this.sessionLookups.delete(sessionId) })
+    this.sessionLookups.set(sessionId, lookup)
+    return lookup
+  }
+
+  /**
+   * Resolve one session's working directory through persistence, remembering the answer either way.
+   * @param persistence - the composed persistence backend.
+   * @param sessionId - the session to resolve.
+   * @returns its working directory, or `undefined` when persistence does not know one.
+   */
+  private async lookUpPersistedCwd(persistence: PersistedSessions, sessionId: string): Promise<string | undefined> {
+    let cwd: string | undefined
     try {
-      // One listing answers for every session on disk, so the map is filled wholesale rather than
-      // one lookup at a time.
-      for (const header of await persistence.list()) {
-        if (typeof header.cwd === 'string') this.sessionCwd.set(header.id, header.cwd)
+      if (typeof persistence.stat === 'function') {
+        const snapshot = await persistence.stat(sessionId)
+        cwd = snapshot?.header.cwd
+      } else {
+        // Without `stat`, one listing answers for every session on disk, so the map is filled
+        // wholesale rather than listing again for the next unknown id.
+        const snapshots = await persistence.list()
+        for (const snapshot of snapshots) {
+          if (typeof snapshot.header.cwd === 'string') this.sessionCwd.set(snapshot.header.id, snapshot.header.cwd)
+        }
+        cwd = this.sessionCwd.get(sessionId)
       }
     } catch (error) {
-      // A persistence backend that cannot list is a broken installation, not this request's fault;
-      // the caller's own "no project board" message says the actionable part.
-      this.ctx.logger?.debug?.('dsh-tasks: could not list persisted sessions: %o', error)
-      return undefined
+      // A persistence backend that cannot answer is a broken installation, not this request's fault;
+      // the caller's own "no project board" message says the actionable part, and the backoff below
+      // keeps a broken backend from being hammered by the poll.
+      this.ctx.logger?.debug?.('dsh-tasks: could not look up persisted session %s: %o', sessionId, error)
+      cwd = undefined
     }
-    return this.sessionCwd.get(sessionId)
+    if (typeof cwd === 'string') {
+      this.sessionCwd.set(sessionId, cwd)
+      this.sessionMisses.delete(sessionId)
+      return cwd
+    }
+    this.rememberMiss(sessionId)
+    return undefined
+  }
+
+  /**
+   * Note that a session could not be resolved, so the poll does not ask persistence again at once.
+   * @param sessionId - the unresolved session.
+   */
+  private rememberMiss(sessionId: string): void {
+    this.sessionMisses.delete(sessionId)
+    if (this.sessionMisses.size >= MAX_REMEMBERED_MISSES) {
+      // Maps iterate in insertion order, so the first key is the oldest miss.
+      const oldest = this.sessionMisses.keys().next()
+      if (oldest.done !== true) this.sessionMisses.delete(oldest.value)
+    }
+    this.sessionMisses.set(sessionId, Date.now() + SESSION_MISS_BACKOFF_MS)
   }
 
   /**
@@ -528,6 +663,7 @@ export class TasksService extends Service {
           optionalObject(payload, 'patch') as unknown as TaskPatch,
           author,
           now,
+          readOptionalTimestamp(payload, 'expectedUpdatedAt'),
         )
       case 'task.move':
         return (await this.boardForSession(sessionId)).update(
@@ -548,7 +684,7 @@ export class TasksService extends Service {
           parseTaskId(requireString(payload, 'taskId')), false, author, now,
         )
       case 'task.delete':
-        this.removeTask(await this.boardForSession(sessionId), parseTaskId(requireString(payload, 'taskId')), sessionId)
+        this.removeTask(await this.boardForSession(sessionId), parseTaskId(requireString(payload, 'taskId')))
         return { deleted: true }
       case 'comment.add':
         return (await this.boardForSession(sessionId)).addComment(
@@ -591,7 +727,7 @@ export class TasksService extends Service {
    * @returns the agent, or `undefined`.
    */
   private agentFor(sessionId: string): Agent | undefined {
-    return this.ctx.get('agents')?.get(sessionId as SessionId)
+    return this.ctx.get('agents')?.get(sessionId as SessionId) as Agent | undefined
   }
 
   /**
@@ -611,30 +747,140 @@ export class TasksService extends Service {
   }
 
   /**
-   * Consume one job's output.
+   * Read one job's output without taking it from the agent.
+   *
+   * The registry gives each job ONE consuming read cursor, and it belongs to the agent: `job_output`
+   * returns only what was produced since the previous read. A board button that called `read` on a
+   * shell job ate the output the agent was waiting to collect. So only this plugin's own `task` jobs
+   * are read here — they carry final output only, which the registry returns idempotently once the
+   * job has settled and never consumes. Every other kind reports its state with its output withheld.
    * @param sessionId - the session asking.
    * @param jobId - the job to read.
-   * @returns the output produced since the previous read, and the job's state.
-   * @throws TaskValidationError when no job registry is composed, or the job is unknown.
+   * @returns the job's state, and its final output when the board may read it.
+   * @throws TaskValidationError when no job registry is composed.
    */
   readJob(sessionId: string, jobId: string): JobReadResult {
     const jobs = this.ctx.get('jobs')
     if (jobs === undefined) throw new TaskValidationError('no background job registry is composed')
-    const read = jobs.read(jobId as never, this.agentFor(sessionId))
-    return { text: read.text, job: toJobView(read.snapshot, this.jobTasks.get(jobId)?.taskId) }
+    const caller = this.agentFor(sessionId)
+    // `get` is the registry's non-consuming read: state only, cursor untouched.
+    const snapshot = jobs.get(jobId as never, caller)
+    const taskId = this.jobTasks.get(jobId)?.taskId
+    if (snapshot.kind !== 'task') {
+      return { text: '', job: toJobView(snapshot, taskId), outputWithheld: true }
+    }
+    const read = jobs.read(jobId as never, caller)
+    return { text: read.text, job: toJobView(read.snapshot, taskId) }
   }
 
   /**
    * Ask one job to stop.
+   *
+   * A job the caller can see is stopped as the caller, exactly as `job_kill` would. A card's run that
+   * another session in this process started is not visible to the caller — the registry fences jobs
+   * by owning session — yet the card sits on the caller's board with a Stop control on it. That run
+   * is stopped as its owner: the same authority deleting the card already carries.
    * @param sessionId - the session asking.
    * @param jobId - the job to stop.
    * @returns whether a stop was requested or the job had already settled.
-   * @throws TaskValidationError when no job registry is composed, or the job is unknown.
+   * @throws TaskValidationError when no job registry is composed.
    */
-  killJob(sessionId: string, jobId: string): JobKillResult {
+  async killJob(sessionId: string, jobId: string): Promise<JobKillResult> {
     const jobs = this.ctx.get('jobs')
     if (jobs === undefined) throw new TaskValidationError('no background job registry is composed')
-    return { outcome: jobs.kill(jobId as never, this.agentFor(sessionId), 'stopped from the task board') }
+    const caller = this.agentFor(sessionId)
+    const visible = jobs.list(caller).some(snapshot => snapshot.id === jobId)
+    if (!visible) {
+      const board = await this.boardForSession(sessionId)
+      const owned = this.ownedCardRun(board, jobId)
+      if (owned !== undefined) {
+        return { outcome: owned.jobs.kill(jobId as never, owned.agent, STOPPED_FROM_BOARD_REASON) }
+      }
+    }
+    return { outcome: jobs.kill(jobId as never, caller, STOPPED_FROM_BOARD_REASON) }
+  }
+
+  /**
+   * The run this process owns under a job id, when a card on the board is marked with it.
+   * @param board - the board to look on.
+   * @param jobId - the job id.
+   * @returns the owned run, or `undefined`.
+   */
+  private ownedCardRun(board: TaskStore, jobId: string): OwnedRun | undefined {
+    // Job ids are per-process counters, so the marker must also name THIS process as its owner.
+    const marker = board.runMarkers().find(entry =>
+      entry.jobId === jobId && entry.owner !== undefined && ownerProcessState(entry.owner) === 'this-process')
+    if (marker?.owner === undefined) return undefined
+    return this.ownedTaskJob(marker.jobId, marker.owner)
+  }
+
+  /**
+   * The live agent and job registry for a run this process owns, provided the job really is one of
+   * this plugin's card runs.
+   *
+   * The kind check matters because a marker is a row in a file: a hand-edited `running_job_id`
+   * naming someone's shell job must not let a card deletion stop that job with its owner's authority.
+   * @param jobId - the job id the marker records.
+   * @param owner - the marker's owner.
+   * @returns the registry, the owning agent, and the job's snapshot; `undefined` when the registry,
+   *   the owner agent, or the job is gone, or the job is not a card run.
+   */
+  private ownedTaskJob(jobId: string, owner: RunOwner): OwnedRun | undefined {
+    const jobs = this.ctx.get('jobs')
+    const agent = this.agentFor(owner.sessionId)
+    if (jobs === undefined || agent === undefined) return undefined
+    let snapshot: JobSnapshot
+    try {
+      snapshot = jobs.get(jobId as never, agent)
+    } catch (error) {
+      // `get` throws for an unknown job — the registry drops an owner's jobs when that agent is
+      // disposed — and for a foreign one, which a marker naming the wrong session would be. Either
+      // way there is no run of ours to act on, which is the answer this lookup exists to give.
+      this.ctx.logger?.debug?.('dsh-tasks: job %s is not a live run of this process: %o', jobId, error)
+      return undefined
+    }
+    if (snapshot.kind !== 'task') return undefined
+    return { jobs, agent, snapshot }
+  }
+
+  /**
+   * Decide whether a card's running marker is still live.
+   *
+   * The process check comes first (see `./run-owner.ts`). A run this very process owns is judged by
+   * the job registry, the only authority on it: still running is live; settled means its settlement
+   * never reached the card, so the registry's terminal record is written instead; unknown means the
+   * registry — or the agent that owned the job — is gone, and so is the run.
+   * @param marker - the marker to judge.
+   * @returns the verdict.
+   */
+  private judgeRun(marker: RunMarker): RunVerdict {
+    const owner = marker.owner
+    if (owner === undefined || ownerProcessState(owner) !== 'this-process') return judgeRunByProcess(marker)
+    const owned = this.ownedTaskJob(marker.jobId, owner)
+    if (owned === undefined) return { kind: 'interrupted' }
+    const { snapshot } = owned
+    switch (snapshot.status) {
+      case 'running':
+      case 'stopping':
+        return { kind: 'live' }
+      case 'completed':
+      case 'killed':
+      case 'failed':
+        return {
+          kind: 'settled',
+          summary: {
+            jobId: marker.jobId,
+            status: snapshot.status,
+            ...snapshot.detail === undefined ? {} : { detail: snapshot.detail },
+            startedAt: snapshot.startedAt,
+            finishedAt: snapshot.finishedAt ?? Date.now(),
+          },
+        }
+      default: {
+        const unexpected: never = snapshot.status
+        throw new Error(`tasks: unexpected job status ${String(unexpected)}`)
+      }
+    }
   }
 
   /**
@@ -645,26 +891,45 @@ export class TasksService extends Service {
    *
    * A dispatched card owns a live subagent. Deleting the card without stopping it leaves that
    * subagent running against a task nobody can see, reporting to a row that no longer exists —
-   * spending tokens on work whose record has been thrown away. The kill goes first because the
-   * settlement handler looks the card up: once the row is gone it has nothing to write to, and
-   * the job would otherwise settle into a board that has forgotten it.
+   * spending tokens on work whose record has been thrown away. So:
+   *
+   * - A marker whose owner is gone is cleared first; there is nothing to stop.
+   * - A run this process owns is stopped AS ITS OWNER. The registry fences jobs by owning session, and
+   *   any session on the project can open the board, so stopping it as the deleting session failed
+   *   with "belongs to another session" — the failure was swallowed and the subagent kept running.
+   * - A run another live process owns cannot be stopped from here, so the delete is refused with a
+   *   message saying so, rather than deleting the card out from under that run.
    * @param board - the board the card belongs to.
    * @param taskId - the card to delete.
-   * @param sessionId - the session asking, for resolving its agent.
+   * @throws TaskValidationError when a run in another process is still working the card.
    */
-  removeTask(board: TaskStore, taskId: string, sessionId: string): void {
-    const running = board.detail(taskId).task.runningJobId
-    if (running !== undefined) {
-      try {
-        this.killJob(sessionId, running)
-      } catch (error) {
-        // A job the registry has already forgotten, or no registry at all: the card still goes.
-        // Refusing the delete because its run could not be stopped would be the wrong trade.
-        this.ctx.logger?.debug?.('dsh-tasks: could not stop the run for a deleted card: %o', error)
-      }
-      this.jobTasks.delete(running)
-    }
+  removeTask(board: TaskStore, taskId: string): void {
+    board.reconcileRun(taskId, marker => this.judgeRun(marker), Date.now())
+    const marker = board.runMarker(taskId)
+    if (marker !== undefined) this.stopRunForDeletion(marker)
     board.remove(taskId)
+  }
+
+  /**
+   * Stop the live run on a card that is being deleted.
+   * @param marker - the card's marker, already judged live.
+   * @throws TaskValidationError when the run belongs to another process.
+   */
+  private stopRunForDeletion(marker: RunMarker): void {
+    const owner = marker.owner
+    // A marker with no owner is never judged live, so it has been cleared already.
+    if (owner === undefined) return
+    if (ownerProcessState(owner) !== 'this-process') {
+      throw new TaskValidationError(
+        `#${marker.ref} is being worked by a background run in another dsh process (pid ${owner.pid}). `
+        + 'Stop it from that process, or wait for it to finish, then delete the card.',
+      )
+    }
+    const owned = this.ownedTaskJob(marker.jobId, owner)
+    // Judged live a moment ago; a run that settled in between has nothing left to stop.
+    if (owned === undefined) return
+    owned.jobs.kill(marker.jobId as never, owned.agent, DELETED_CARD_REASON)
+    this.jobTasks.delete(marker.jobId)
   }
 
   /**
@@ -688,10 +953,13 @@ export class TasksService extends Service {
   ): Promise<TaskDispatchResult> {
     const config = this.config()
     const board = this.boardFor(sessionId)
-    const detail = board.detail(taskId)
-    if (detail.task.runningJobId !== undefined) {
-      throw new TaskValidationError(`#${detail.task.ref} is already running as job ${detail.task.runningJobId}`)
+    // A marker whose owner has gone is cleared here rather than refused as "already running": this is
+    // the moment someone is asking to run the card again.
+    const current = board.reconcileRun(taskId, marker => this.judgeRun(marker), Date.now())
+    if (current.runningJobId !== undefined) {
+      throw new TaskValidationError(`#${current.ref} is already running as job ${current.runningJobId}`)
     }
+    const detail = board.detail(taskId)
 
     const jobs = this.ctx.get('jobs')
     const subagents = this.ctx.get('subagents')
@@ -713,7 +981,8 @@ export class TasksService extends Service {
 
     const author: TaskAuthor = { actor: 'user', sessionId }
     const startedAt = Date.now()
-    const projectRoot = board.databasePath
+    const databasePath = board.databasePath
+    const owner = currentRunOwner(sessionId)
 
     // The job id only exists after `start` returns, while `run()` is called inside it. The
     // settlement tap therefore waits on this promise rather than reading a variable that may still
@@ -730,24 +999,34 @@ export class TasksService extends Service {
         const run = subagents.start(config.subagentProvider, {
           label: `#${detail.task.ref} ${detail.task.title}`,
           prompt: [{ type: 'text', text: buildDispatchPrompt(detail, instructions) }],
-          parent,
+          // The same agent object; see the note on `Agent` about the two type copies.
+          parent: parent as never,
           signal: controller.signal,
         })
         const done = settleSubagentRun(run, controller.signal)
-        void done.then(
-          async (outcome) => { await this.settleDispatch(await idReady, taskId, projectRoot, outcome, startedAt) },
-          () => {
-            // `settleSubagentRun` folds every failure into an outcome, so this branch is
-            // unreachable; it exists so an unexpected rejection cannot become an unhandled one.
-          },
+        // Observed, not fire-and-forget: `settleSubagentRun` never rejects and `settleDispatch` never
+        // throws; the rejection arm exists so a broken contract is logged rather than unhandled.
+        done.then(
+          async (outcome) => { this.settleDispatch(await idReady, taskId, databasePath, owner, outcome, startedAt) },
+          (error: unknown) => { this.ctx.logger?.warn?.('dsh-tasks: a dispatched run settled abnormally: %o', error) },
         )
         return { cancel: (reason?: string) => { controller.abort(reason ?? 'task run stopped') }, done }
       },
     })
     announce(jobId)
-    this.jobTasks.set(jobId, { taskId, projectRoot })
+    this.jobTasks.set(jobId, { taskId, projectRoot: databasePath })
 
-    let task = board.startRun(taskId, jobId, author, startedAt)
+    let task: Task
+    try {
+      task = board.startRun(taskId, jobId, owner, author, startedAt)
+    } catch (error) {
+      // Another process claimed the card between the check above and this write. The job just
+      // started must not run on unrecorded: stop it (as its owner, which this session is) and report.
+      jobs.kill(jobId as never, parent, 'the card was claimed by another run')
+      this.jobTasks.delete(jobId)
+      throw error
+    }
+    this.holdCompletionNotice(jobs, jobId, parent)
     if (config.dispatchStatus !== 'none' && task.status !== config.dispatchStatus) {
       task = board.update(taskId, { status: config.dispatchStatus }, { actor: 'system', sessionId }, startedAt)
     }
@@ -755,53 +1034,106 @@ export class TasksService extends Service {
   }
 
   /**
+   * Keep the job controller from opening a model turn when a dispatched card's run finishes.
+   *
+   * `@deepseek-ai/dsh-tool-jobs` delivers a completion notice for every unreported job to its owning
+   * agent, and under its default `completionDelivery: 'wakeup'` an idle owner gets a whole new model
+   * turn for it. Delivery is that plugin's deployment setting, not a per-job option, so a producer
+   * cannot choose it. But a dispatch is started by a person on the board, not by the agent: the agent
+   * never asked for the result, and the board records it on the card. Spending a model request on an
+   * unsolicited notice is the wrong default.
+   *
+   * The registry's contract offers one per-job way to say "this completion is collected": a `wait`
+   * pending when the job settles marks it reported, and a reported job gets no notice. So this holds a
+   * wait for the life of the run, re-armed in {@link NOTICE_HOLD_SLICE_MS} slices. It is owned by the
+   * service, not fired and forgotten: the service's disposal aborts it, and its only failures — that
+   * abort, or the registry forgetting the job along with its owner — both mean there is no notice
+   * left to hold. The agent can still find the run with `job_list` and read it with `job_output`.
+   * @param jobs - the job registry.
+   * @param jobId - the dispatched run.
+   * @param owner - its owning agent.
+   */
+  private holdCompletionNotice(jobs: JobRegistryFace, jobId: string, owner: Agent): void {
+    const signal = this.noticeHolds.signal
+    const hold = async (): Promise<void> => {
+      for (;;) {
+        const snapshot = await jobs.wait(jobId as never, NOTICE_HOLD_SLICE_MS, owner, signal)
+        if (TERMINAL_JOB_STATUSES.has(snapshot.status)) return
+      }
+    }
+    hold().catch((error: unknown) => {
+      this.ctx.logger?.debug?.('dsh-tasks: stopped holding the completion notice for %s: %o', jobId, error)
+    })
+  }
+
+  /**
    * Record a finished dispatch on its card.
    *
    * Reached from a job settlement, which the registry runs outside any request, so it must not
-   * throw: a board that has since been closed or a card that has since been deleted are both
-   * ordinary, and neither is worth breaking the registry's listener for.
+   * throw. The board is addressed by path, not through whatever board the current registry has open:
+   * a settings save rebuilds the registry and a plugin reload replaces the service, and the run's
+   * outcome must reach its card through both.
+   *
+   * Synchronous once the outcome is known, deliberately: the stale-run sweep treats a settled job
+   * whose marker is still set as a lost settlement, and a write that never yields cannot be observed
+   * half-done by a request arriving in between.
    * @param jobId - the settled job.
    * @param taskId - the card it was working.
    * @param databasePath - the board the card belongs to.
-   * @param outcome - how the run ended.
+   * @param owner - the process and session that started the run.
+   * @param outcome - how the run ended, with its output.
    * @param startedAt - epoch ms the run started.
    */
-  private async settleDispatch(
+  private settleDispatch(
     jobId: string,
     taskId: string,
     databasePath: string,
-    outcome: JobOutcome,
+    owner: RunOwner,
+    outcome: DispatchOutcome,
     startedAt: number,
-  ): Promise<void> {
+  ): void {
     this.jobTasks.delete(jobId)
     const finishedAt = Date.now()
-    try {
-      const board = this.registry.byPath(databasePath)
-      if (board === undefined) return
-      board.finishRun(
-        taskId,
-        {
-          jobId,
-          status: outcome.status,
-          ...outcome.detail === undefined ? {} : { detail: outcome.detail },
-          startedAt,
-          finishedAt,
-        },
-        { actor: 'system' },
-        finishedAt,
-      )
-      const completed = this.config().dispatchCompletedStatus
-      if (outcome.status === 'completed' && completed !== 'none') {
-        board.update(taskId, { status: completed }, { actor: 'system' }, finishedAt)
-      }
-    } catch (error) {
-      // The card or its board is gone. Nothing else observes this settlement, so there is no one to
-      // report to and nothing left to update.
-      this.ctx.logger?.debug?.('dsh-tasks: could not record run settlement: %o', error)
+    const summary: TaskRunSummary = {
+      jobId,
+      status: outcome.status,
+      ...outcome.detail === undefined ? {} : { detail: outcome.detail },
+      startedAt,
+      finishedAt,
     }
-    await Promise.resolve()
+    const completed = this.config().dispatchCompletedStatus
+    const report = runReport(jobId, outcome)
+    try {
+      this.registry.withBoardAt(databasePath, (board) => {
+        board.finishRun(taskId, summary, owner, { actor: 'system' }, finishedAt, {
+          ...report === undefined ? {} : { report },
+          ...outcome.status === 'completed' && completed !== 'none' ? { completedStatus: completed } : {},
+        })
+      })
+    } catch (error) {
+      // The file became unreadable, or a writer held it past the busy timeout. Nothing observes this
+      // settlement to report to, and the marker stays in place: the next open of the board, or the
+      // next dispatch or delete of this card, finds the job settled in the registry and records it.
+      this.ctx.logger?.warn?.('dsh-tasks: could not record the settlement of %s on its card: %o', jobId, error)
+    }
   }
+}
 
+/**
+ * Read an optional epoch-ms field off an untrusted RPC payload.
+ * @param payload - the decoded request body.
+ * @param field - the field to read.
+ * @returns the value, or `undefined` when absent.
+ * @throws TaskValidationError when present but not a non-negative whole number.
+ */
+function readOptionalTimestamp(payload: unknown, field: string): number | undefined {
+  if (typeof payload !== 'object' || payload === null) return undefined
+  const value = (payload as Record<string, unknown>)[field]
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new TaskValidationError(`${field} must be a whole number of milliseconds since the epoch`)
+  }
+  return value
 }
 
 /**
@@ -853,26 +1185,82 @@ export function buildDispatchPrompt(detail: TaskDetail, instructions: string | u
   return lines.join('\n')
 }
 
+/** A run of this process, reachable as its owner. */
+interface OwnedRun {
+  /** The job registry holding the run. */
+  jobs: JobRegistryFace
+  /** The agent that owns the job. */
+  agent: Agent
+  /** The job's state when it was looked up. */
+  snapshot: JobSnapshot
+}
+
+/** How a dispatched run ended, as handed to the job registry and recorded on the card. */
+interface DispatchOutcome {
+  /** Terminal status. */
+  status: 'completed' | 'killed' | 'failed'
+  /** Why it ended, including the provider's diagnostic for a run that did not complete. */
+  detail?: string
+  /**
+   * The child's final assistant text — or, for a run that did not complete, what it had produced.
+   * The registry returns it from `job_output` once the job settles (the job has no stream to read),
+   * and the board writes it on the card as a comment.
+   */
+  output?: string
+}
+
+/** One content block of a subagent's output, as far as this plugin reads it. */
+interface OutputBlock {
+  readonly type: string
+  readonly text?: unknown
+}
+
+/** A subagent run's terminal result (`SubagentResult` on 0.1.5-rc.2), as far as this plugin reads it. */
+interface SubagentOutcome {
+  readonly stopReason: string
+  readonly output?: readonly OutputBlock[]
+  readonly diagnostic?: string
+}
+
+/**
+ * The text of a subagent's output blocks.
+ * @param blocks - the child's output.
+ * @returns the joined text, or `undefined` when there is none.
+ */
+function outputText(blocks: readonly OutputBlock[] | undefined): string | undefined {
+  const pieces = (blocks ?? []).flatMap(block => (block.type === 'text' && typeof block.text === 'string' ? [block.text] : []))
+  const text = pieces.join('')
+  return text.trim() === '' ? undefined : text
+}
+
 /**
  * Fold a subagent run into a job outcome without ever rejecting.
  *
  * The job registry converts a rejected `done` into a bare `failed` with no detail, which loses the
- * only explanation the user would have had; folding here keeps it.
+ * only explanation the user would have had; folding here keeps it. The child's output and the
+ * provider's diagnostic are carried too: dropping them left a completed job whose `job_output` was
+ * empty and a card that recorded "finished" and nothing of what was done.
  * @param start - the pending subagent start.
  * @param signal - the run's own cancellation, to tell a kill apart from a fault.
  * @returns the outcome the registry records.
  */
 async function settleSubagentRun(
-  start: Promise<{ result: Promise<{ stopReason: string }>; dispose(): Promise<void> }>,
+  start: Promise<{ result: Promise<SubagentOutcome>; dispose(): Promise<void> }>,
   signal: AbortSignal,
-): Promise<JobOutcome> {
+): Promise<DispatchOutcome> {
   try {
     const run = await start
     try {
       const result = await run.result
-      return result.stopReason === 'completed'
-        ? { status: 'completed', detail: 'finished' }
-        : { status: signal.aborted ? 'killed' : 'failed', detail: `subagent stopped: ${result.stopReason}` }
+      const output = outputText(result.output)
+      const carried = output === undefined ? {} : { output }
+      if (result.stopReason === 'completed') return { status: 'completed', detail: 'finished', ...carried }
+      const diagnostic = result.diagnostic === undefined ? '' : `; ${result.diagnostic}`
+      return {
+        status: signal.aborted ? 'killed' : 'failed',
+        detail: `subagent stopped: ${result.stopReason}${diagnostic}`,
+        ...carried,
+      }
     } finally {
       await run.dispose()
     }
@@ -881,6 +1269,33 @@ async function settleSubagentRun(
       ? { status: 'killed', detail: 'stopped' }
       : { status: 'failed', detail: error instanceof Error ? error.message : String(error) }
   }
+}
+
+/** Appended to a run report cut down to fit in a comment. */
+const TRUNCATED_REPORT_NOTE = '\n\n… (truncated; `job_output` returns the whole output while the job is still listed)'
+
+/**
+ * The comment a finished run leaves on its card.
+ *
+ * A comment rather than a field of `last_run`, because `last_run` travels with every card on every
+ * board read and a report can run to many kilobytes; comments are read only with the card's detail.
+ * @param jobId - the run's job id.
+ * @param outcome - how it ended.
+ * @returns the comment, or `undefined` for a run with nothing to report (stopped, no output).
+ */
+function runReport(jobId: string, outcome: DispatchOutcome): string | undefined {
+  if (outcome.output === undefined && outcome.status !== 'failed') return undefined
+  const detail = outcome.detail === undefined ? '.' : `: ${outcome.detail}`
+  const heading = outcome.status === 'completed'
+    ? `**Run ${jobId} completed.**`
+    : `**Run ${jobId} ${outcome.status === 'failed' ? 'failed' : 'was stopped'}**${detail}`
+  let body = ''
+  if (outcome.output !== undefined) {
+    body = outcome.status === 'completed' ? `\n\n${outcome.output}` : `\n\nOutput before it ended:\n\n${outcome.output}`
+  }
+  const report = `${heading}${body}`
+  if (report.length <= MAX_COMMENT_LENGTH) return report
+  return `${report.slice(0, MAX_COMMENT_LENGTH - TRUNCATED_REPORT_NOTE.length)}${TRUNCATED_REPORT_NOTE}`
 }
 
 export { TASK_PRIORITIES, TASK_STATUSES }

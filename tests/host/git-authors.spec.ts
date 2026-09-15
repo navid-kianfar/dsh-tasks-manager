@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { GitAuthorDirectory, parseAuthorLog, withConfiguredIdentity } from '../../src/host/git-authors.ts'
@@ -172,5 +172,52 @@ describe('GitAuthorDirectory', () => {
     ])
 
     expect(first).toBe(second)
+  })
+
+  it('never runs an executable the repository configures, even with signature display turned on', async () => {
+    const root = repository([['Ada', 'ada@example.com']])
+    const marker = join(root, 'gpg-ran')
+    const fakeGpg = join(root, 'fake-gpg.sh')
+    writeFileSync(fakeGpg, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\nexit 1\n`)
+    chmodSync(fakeGpg, 0o755)
+    const git = (...args: string[]): string =>
+      execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim()
+    // A repository is untrusted input: a clone, an extracted archive, a directory a session was
+    // pointed at. Its `.git/config` can name any program, and `log.showSignature` makes `git log`
+    // run `gpg.program` for every signed commit whatever `--format` asks for.
+    git('config', 'gpg.program', fakeGpg)
+    git('config', 'log.showSignature', 'true')
+    git('config', 'core.fsmonitor', fakeGpg)
+    // A commit carrying a signature header, written as a raw object so the test needs no real gpg.
+    const tree = git('rev-parse', 'HEAD^{tree}')
+    const parent = git('rev-parse', 'HEAD')
+    const object = [
+      `tree ${tree}`,
+      `parent ${parent}`,
+      'author Mallory <mallory@example.com> 1700000000 +0000',
+      'committer Mallory <mallory@example.com> 1700000000 +0000',
+      'gpgsig -----BEGIN PGP SIGNATURE-----',
+      ' ',
+      ' iQEzBAABCAAdFiEE',
+      ' -----END PGP SIGNATURE-----',
+      '',
+      'signed-looking commit',
+      '',
+    ].join('\n')
+    const signed = execFileSync('git', ['-C', root, 'hash-object', '-t', 'commit', '-w', '--stdin'], {
+      input: object,
+      encoding: 'utf8',
+    }).trim()
+    git('update-ref', 'HEAD', signed)
+    // Prove the trap is armed: a plain `git log` in this repository does run the program.
+    execFileSync('git', ['-C', root, 'log', '-1', '--format=%an'], { stdio: 'ignore' })
+    expect(existsSync(marker)).toBe(true)
+    rmSync(marker)
+
+    const result = await new GitAuthorDirectory().read(root, Date.now())
+
+    expect(result.available).toBe(true)
+    expect(result.authors.map(author => author.name)).toContain('Mallory')
+    expect(existsSync(marker)).toBe(false)
   })
 })

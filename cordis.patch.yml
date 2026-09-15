@@ -33,6 +33,8 @@
         # button that fails on click. Unset leaves the action hidden and the settings card says so.
         # A standard dsh-base profile composes `spawn` and `fork`.
         subagentProvider: ''
+        # A dispatched run records its report on the card and does not wake the agent: dsh-tool-jobs'
+        # completion notice is suppressed for the board's own runs, whatever its completionDelivery.
         dispatchStatus: in_progress
         # Left at `none` deliberately: whether a finished run means the work is done is a judgement
         # the run cannot make for itself. Set a column to move dispatched cards automatically.

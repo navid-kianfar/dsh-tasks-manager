@@ -34,9 +34,10 @@ import {
   type TaskRunSummary,
   type TaskStatus,
 } from '../domain/types.ts'
-import { firstRank, rankBetween } from '../domain/rank.ts'
+import { firstRank, rankBetween, rankSequence } from '../domain/rank.ts'
 import {
   DEFAULT_QUERY_LIMIT,
+  MAX_QUERY_LIMIT,
   TaskValidationError,
   parseAssignee,
   parseBody,
@@ -48,7 +49,14 @@ import {
   parseTimestamp,
   parseTitle,
 } from '../domain/validate.ts'
-import { canonicalDatabasePath, openBoardDatabase, resolveDatabasePath, type JournalMode } from './db.ts'
+import {
+  canonicalDatabasePath,
+  openBoardDatabase,
+  resolveDatabasePath,
+  statusOrderSql,
+  type JournalMode,
+} from './db.ts'
+import { decodeRunOwner, ownerProcessState, type RunOwner } from './run-owner.ts'
 
 /** Raised when a caller addresses a card or comment that is not in this board. */
 export class TaskNotFoundError extends Error {
@@ -60,6 +68,96 @@ export class TaskNotFoundError extends Error {
     super(`no ${what} ${JSON.stringify(id)} on this board`)
     this.name = 'TaskNotFoundError'
   }
+}
+
+/**
+ * Raised when a change was made against a card that someone else has changed since it was read.
+ *
+ * Its own class so the RPC layer can tell the person what happened — their edit was not applied, and
+ * the board is being re-read — rather than presenting it as a malformed value.
+ */
+export class TaskConflictError extends Error {
+  /**
+   * @param ref - the card's display number, for the message.
+   */
+  constructor(ref: number) {
+    super(`#${ref} was changed by someone else while you were editing it; your change was not applied. The card has been reloaded — make the change again if it still applies.`)
+    this.name = 'TaskConflictError'
+  }
+}
+
+/** A card's running marker, as the stale-run sweep and the deletion path judge it. */
+export interface RunMarker {
+  /** The card being worked. */
+  taskId: string
+  /** Its display number, for messages. */
+  ref: number
+  /** The job registry id recorded when the run started. Unique only within its owner process. */
+  jobId: string
+  /** The process and session that own the run; absent for a marker written before owners existed. */
+  owner: RunOwner | undefined
+}
+
+/**
+ * What the sweep should do with one marker.
+ *
+ * - `live`: leave it; its owner can still settle it.
+ * - `interrupted`: its owner is gone and nothing will ever settle it; clear it and say so in the history.
+ * - `settled`: the run finished but its settlement never reached the board; record this outcome.
+ */
+export type RunVerdict =
+  | { readonly kind: 'live' }
+  | { readonly kind: 'interrupted' }
+  | { readonly kind: 'settled'; readonly summary: TaskRunSummary }
+
+/** Decides the fate of one running marker. */
+export type RunJudge = (marker: RunMarker) => RunVerdict
+
+/**
+ * Judge a marker by its owner process alone.
+ *
+ * The default for a registry with no job registry to consult. A run owned by this very process is
+ * `live` here because only the job registry could say otherwise; the service supplies a judge that
+ * asks it. A marker with no recorded owner was written by a build that predates owners — no process
+ * running this build can be settling it — so it is `interrupted`.
+ * @param marker - the marker to judge.
+ * @returns the verdict.
+ */
+export function judgeRunByProcess(marker: RunMarker): RunVerdict {
+  if (marker.owner === undefined) return { kind: 'interrupted' }
+  const state = ownerProcessState(marker.owner)
+  switch (state) {
+    case 'this-process':
+    case 'alive':
+    case 'unreachable':
+      return { kind: 'live' }
+    case 'gone':
+      return { kind: 'interrupted' }
+    default: {
+      const unexpected: never = state
+      throw new Error(`tasks: unexpected owner state ${String(unexpected)}`)
+    }
+  }
+}
+
+/** How a settlement landed on its card. */
+export interface FinishedRun {
+  /** The card as it now stands. */
+  task: Task
+  /**
+   * Whether this run was still the card's current run. `false` means the marker had already been
+   * swept or replaced by a newer dispatch: the history records the outcome, but the card's running
+   * state and any automatic status move belong to whatever holds the marker now.
+   */
+  current: boolean
+}
+
+/** What else a settlement does to its card, beyond recording the outcome. */
+export interface RunSettlementEffects {
+  /** A comment carrying the run's report, when there is one. */
+  report?: string | undefined
+  /** The column to move the card to, applied only while the run is still the card's current one. */
+  completedStatus?: TaskStatus | undefined
 }
 
 /** Deployment choices the store itself needs. */
@@ -95,6 +193,7 @@ interface TaskRow {
   session_id: string | null
   running_job_id: string | null
   last_run: string | null
+  run_owner: string | null
 }
 
 /** Shape one `comments` row comes back as. */
@@ -125,6 +224,21 @@ export interface TaskAuthor {
   actor: TaskActor
   /** The session it was made from, when there was one. */
   sessionId?: string | undefined
+}
+
+/** Workflow-position ordering of the `status` column, shared by every ordered board read. */
+const STATUS_ORDER = statusOrderSql('status')
+
+/** A card's creation fields once validated, ready to insert. */
+interface ParsedCreate {
+  title: string
+  body: string
+  status: TaskStatus
+  priority: TaskPriority
+  labels: string[]
+  assignee: string | undefined
+  dueAt: number | undefined
+  place: TaskPlacement | undefined
 }
 
 /** Statuses this build considers finished, for the `completedAt` stamp. */
@@ -223,6 +337,16 @@ function toTask(row: TaskRow): Task {
 }
 
 /**
+ * A row's running marker.
+ * @param row - the `tasks` row.
+ * @returns the marker, or `undefined` when the card is idle.
+ */
+function toMarker(row: TaskRow): RunMarker | undefined {
+  if (row.running_job_id === null) return undefined
+  return { taskId: row.id, ref: row.ref, jobId: row.running_job_id, owner: decodeRunOwner(row.run_owner) }
+}
+
+/**
  * Turn a comment row into the domain value.
  * @param row - the `comments` row.
  * @returns the comment.
@@ -291,6 +415,8 @@ export class TaskStore {
   readonly #db: DatabaseSync
   readonly #options: TaskStoreOptions
   readonly #statements = new Map<string, StatementSync>()
+  /** How many {@link #transaction} calls are active, so an inner one joins the outer. */
+  #transactionDepth = 0
 
   /** Absolute path of the database this store owns, so callers can tell the user where to look. */
   readonly databasePath: string
@@ -347,18 +473,37 @@ export class TaskStore {
    *
    * Rolls back on any throw, including a validation error raised part-way through a multi-field
    * patch — a patch is one edit, so half of it must not survive.
+   *
+   * Re-entrant: a call made while another is running joins it rather than opening a second
+   * transaction SQLite would refuse. That is what lets one settlement record the outcome, write the
+   * report, and move the card as a single unit by composing the public operations that do each.
    * @param work - the body; its return value becomes the call's.
    * @returns whatever `work` returned.
    */
   #transaction<T>(work: () => T): T {
+    if (this.#transactionDepth > 0) return this.#joined(work)
     this.#db.exec('BEGIN IMMEDIATE')
     try {
-      const result = work()
+      const result = this.#joined(work)
       this.#db.exec('COMMIT')
       return result
     } catch (error) {
       this.#db.exec('ROLLBACK')
       throw error
+    }
+  }
+
+  /**
+   * Run work inside the current transaction, keeping the depth count.
+   * @param work - the body.
+   * @returns whatever `work` returned.
+   */
+  #joined<T>(work: () => T): T {
+    this.#transactionDepth++
+    try {
+      return work()
+    } finally {
+      this.#transactionDepth--
     }
   }
 
@@ -392,16 +537,14 @@ export class TaskStore {
    * The board's change counter.
    *
    * The browser polls this rather than the board itself, so an idle board costs one integer read
-   * per poll instead of every card.
+   * per poll instead of every card. It is advanced by triggers in the database (see `./db.ts`), not
+   * by this class, so a change made with `sqlite3` or by another process moves it too.
    * @returns the current revision.
    */
   revision(): number {
-    return this.#meta('revision', 0)
-  }
-
-  /** Advance the revision. Called inside the transaction of every mutation. */
-  #bump(): void {
-    this.#setMeta('revision', this.revision() + 1)
+    const row = one<{ value: string }>(this.#prepare("SELECT value FROM meta WHERE key = 'revision'"))
+    const value = row === undefined ? 0 : Number.parseInt(row.value, 10)
+    return Number.isSafeInteger(value) ? value : 0
   }
 
   /**
@@ -464,13 +607,39 @@ export class TaskStore {
   }
 
   /**
-   * The rank of a card, for resolving a placement's neighbours.
+   * The rank of a placement's neighbour, provided it is still in the destination column.
+   *
+   * A neighbour another writer has since moved to a different column, archived, or deleted is not a
+   * neighbour any more: its rank belongs to another column's order, and landing next to it would
+   * put the card at an arbitrary spot in this one.
    * @param taskId - the neighbour card.
-   * @returns its rank, or `null` when it is not on the board any more.
+   * @param status - the destination column.
+   * @param excludeId - the card being placed, which cannot be its own neighbour.
+   * @returns its rank, or `null` when it is no longer an active card in that column.
    */
-  #rankOf(taskId: string | undefined): string | null {
-    if (taskId === undefined) return null
-    const row = one<{ rank: string }>(this.#prepare('SELECT rank FROM tasks WHERE id = ?'), taskId)
+  #neighbourRank(taskId: string | undefined, status: TaskStatus, excludeId: string | undefined): string | null {
+    if (taskId === undefined || taskId === excludeId) return null
+    const row = one<{ rank: string }>(
+      this.#prepare('SELECT rank FROM tasks WHERE id = ? AND status = ? AND archived = 0'),
+      taskId,
+      status,
+    )
+    return row?.rank ?? null
+  }
+
+  /**
+   * The nearest rank in a column strictly above or below a key.
+   * @param status - the column.
+   * @param rank - the key to look from.
+   * @param direction - `next` for the smallest rank above it, `previous` for the largest below it.
+   * @param excludeId - a card to ignore, for a move within the column.
+   * @returns the neighbouring rank, or `null` at that end of the column.
+   */
+  #adjacentRank(status: TaskStatus, rank: string, direction: 'next' | 'previous', excludeId: string | undefined): string | null {
+    const sql = direction === 'next'
+      ? 'SELECT MIN(rank) AS rank FROM tasks WHERE status = ? AND archived = 0 AND id IS NOT ? AND rank > ?'
+      : 'SELECT MAX(rank) AS rank FROM tasks WHERE status = ? AND archived = 0 AND id IS NOT ? AND rank < ?'
+    const row = one<{ rank: string | null }>(this.#prepare(sql), status, excludeId ?? null, rank)
     return row?.rank ?? null
   }
 
@@ -486,13 +655,16 @@ export class TaskStore {
    * @returns the new rank.
    */
   #rankFor(status: TaskStatus, place: TaskPlacement | undefined, excludeId?: string): string {
-    const after = this.#rankOf(place?.after)
-    const before = this.#rankOf(place?.before)
-    if (after !== null || before !== null) {
-      // Both named and still in order: land between them. Otherwise one end is known and the other
-      // is the column's own edge, which `rankBetween` treats as open.
-      if (after !== null && before !== null && after >= before) return rankBetween(after, null)
-      return rankBetween(after, before)
+    const after = this.#neighbourRank(place?.after, status, excludeId)
+    const before = this.#neighbourRank(place?.before, status, excludeId)
+    if (after !== null && (before === null || after >= before)) {
+      // Land directly below `after`. The upper bound is whatever really follows it in the column
+      // now — a missing or out-of-order `before` would otherwise leave the top open, and a key
+      // minted against an open top can sort past every card that follows.
+      return rankBetween(after, this.#adjacentRank(status, after, 'next', excludeId))
+    }
+    if (before !== null) {
+      return rankBetween(this.#adjacentRank(status, before, 'previous', excludeId), before)
     }
     const bounds = this.#columnBounds(status, excludeId)
     if (bounds === undefined) return firstRank()
@@ -583,7 +755,9 @@ export class TaskStore {
     const limit = parseLimit(query.limit)
     const clause = where.length === 0 ? '' : ` WHERE ${where.join(' AND ')}`
     const rows = many<TaskRow>(
-      this.#prepare(`SELECT * FROM tasks${clause} ORDER BY status, rank, created_at LIMIT ?`),
+      // Workflow order, not `ORDER BY status`: alphabetically `done` sorts before `in_progress` and
+      // `todo`, and the LIMIT would then cut outstanding work to make room for finished work.
+      this.#prepare(`SELECT * FROM tasks${clause} ORDER BY ${STATUS_ORDER}, rank, created_at LIMIT ?`),
       ...params,
       limit,
     )
@@ -622,44 +796,115 @@ export class TaskStore {
    * @returns the created card.
    */
   create(input: TaskCreate, author: TaskAuthor, now: number): Task {
-    const title = parseTitle(input.title)
-    const body = input.body === undefined ? '' : parseBody(input.body)
-    const status = input.status === undefined ? this.#options.defaultStatus : parseStatus(input.status)
-    const priority = input.priority === undefined ? 'normal' : parsePriority(input.priority)
-    const labels = input.labels === undefined ? [] : parseLabels(input.labels)
-    const assignee = input.assignee === undefined ? undefined : parseAssignee(input.assignee)
-    const dueAt = input.dueAt === undefined ? undefined : parseTimestamp(input.dueAt, 'dueAt')
+    const [created] = this.createMany([input], author, now)
+    if (created === undefined) throw new Error('tasks: creating one card produced none')
+    return created
+  }
 
+  /**
+   * Add several cards as one unit, in the order given.
+   *
+   * One transaction: every input is validated before anything is written, and a failure part-way
+   * through leaves none of the batch behind — a model retrying a half-applied `task_add` would
+   * otherwise duplicate the half that landed.
+   *
+   * Order is preserved whatever the placement setting. Creating a batch one card at a time with
+   * `top` placement put each above the last, so a list given as A, B, C appeared as C, B, A. Instead
+   * each column's new cards take one ascending run of keys at the configured end.
+   * @param inputs - the cards' initial fields, unvalidated.
+   * @param author - who is adding them and from where.
+   * @param now - epoch ms to stamp.
+   * @returns the created cards, in input order.
+   */
+  createMany(inputs: readonly TaskCreate[], author: TaskAuthor, now: number): Task[] {
+    const parsed: readonly ParsedCreate[] = inputs.map(input => this.#parseCreate(input))
     return this.#transaction(() => {
-      const id = mintId('t')
-      const rank = this.#rankFor(status, input.place)
-      this.#prepare(`
-        INSERT INTO tasks (
-          id, ref, title, body, status, priority, labels, assignee, rank, archived,
-          created_at, updated_at, completed_at, archived_at, due_at, created_by, session_id,
-          running_job_id, last_run
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL)
-      `).run(
-        id,
-        this.#nextRef(),
-        title,
-        body,
-        status,
-        priority,
-        JSON.stringify(labels),
-        assignee ?? null,
-        rank,
-        now,
-        now,
-        TERMINAL.has(status) ? now : null,
-        dueAt ?? null,
-        author.actor,
-        author.sessionId ?? null,
-      )
-      this.#log(id, 'created', author, now, undefined, title)
-      this.#bump()
-      return toTask(this.#requireRow(id))
+      const ranks = this.#batchRanks(parsed)
+      return parsed.map((card, index) => this.#insert(card, ranks[index] ?? this.#rankFor(card.status, card.place), author, now))
     })
+  }
+
+  /**
+   * Validate one card's creation fields.
+   * @param input - the unvalidated fields.
+   * @returns the canonical values.
+   */
+  #parseCreate(input: TaskCreate): ParsedCreate {
+    return {
+      title: parseTitle(input.title),
+      body: input.body === undefined ? '' : parseBody(input.body),
+      status: input.status === undefined ? this.#options.defaultStatus : parseStatus(input.status),
+      priority: input.priority === undefined ? 'normal' : parsePriority(input.priority),
+      labels: input.labels === undefined ? [] : parseLabels(input.labels),
+      assignee: input.assignee === undefined ? undefined : parseAssignee(input.assignee),
+      dueAt: input.dueAt === undefined ? undefined : parseTimestamp(input.dueAt, 'dueAt'),
+      place: input.place,
+    }
+  }
+
+  /**
+   * Mint the keys for a batch's cards that name no position of their own.
+   *
+   * Cards are grouped by column, and each group takes an ascending run at the configured end — above
+   * the column's current first card for `top`, below its last for `bottom` — so they read in input
+   * order. A card that names a placement is left out and placed individually.
+   * @param cards - the batch, validated.
+   * @returns keys by batch index; indices with an explicit placement are absent.
+   */
+  #batchRanks(cards: readonly ParsedCreate[]): readonly (string | undefined)[] {
+    const byColumn = new Map<TaskStatus, number[]>()
+    cards.forEach((card, index) => {
+      if (card.place !== undefined) return
+      const indices = byColumn.get(card.status) ?? []
+      indices.push(index)
+      byColumn.set(card.status, indices)
+    })
+    const ranks: (string | undefined)[] = cards.map(() => undefined)
+    for (const [status, indices] of byColumn) {
+      const bounds = this.#columnBounds(status)
+      const keys = this.#options.newTaskPlacement === 'top'
+        ? rankSequence(null, bounds?.first ?? null, indices.length)
+        : rankSequence(bounds?.last ?? null, null, indices.length)
+      indices.forEach((index, position) => { ranks[index] = keys[position] })
+    }
+    return ranks
+  }
+
+  /**
+   * Insert one validated card with its first history entry. Runs inside the caller's transaction.
+   * @param card - the validated fields.
+   * @param rank - its position key.
+   * @param author - who is adding it.
+   * @param now - epoch ms to stamp.
+   * @returns the stored card.
+   */
+  #insert(card: ParsedCreate, rank: string, author: TaskAuthor, now: number): Task {
+    const id = mintId('t')
+    this.#prepare(`
+      INSERT INTO tasks (
+        id, ref, title, body, status, priority, labels, assignee, rank, archived,
+        created_at, updated_at, completed_at, archived_at, due_at, created_by, session_id,
+        running_job_id, last_run, run_owner
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, NULL)
+    `).run(
+      id,
+      this.#nextRef(),
+      card.title,
+      card.body,
+      card.status,
+      card.priority,
+      JSON.stringify(card.labels),
+      card.assignee ?? null,
+      rank,
+      now,
+      now,
+      TERMINAL.has(card.status) ? now : null,
+      card.dueAt ?? null,
+      author.actor,
+      author.sessionId ?? null,
+    )
+    this.#log(id, 'created', author, now, undefined, card.title)
+    return toTask(this.#requireRow(id))
   }
 
   /**
@@ -671,12 +916,22 @@ export class TaskStore {
    * @param patch - the fields to change; absent keys are left alone, `null` clears a clearable one.
    * @param author - who is changing it and from where.
    * @param now - epoch ms to stamp.
+   * @param expectedUpdatedAt - the card's `updatedAt` as the caller last read it. When given, the
+   *   change applies only if nobody has changed the card since; omitted, the change applies
+   *   unconditionally (the model's tools, which read and write in one call).
    * @returns the card as it now stands.
    * @throws TaskNotFoundError when the board has no such card.
+   * @throws TaskConflictError when `expectedUpdatedAt` is stale.
    */
-  update(taskId: string, patch: TaskPatch, author: TaskAuthor, now: number): Task {
+  update(taskId: string, patch: TaskPatch, author: TaskAuthor, now: number, expectedUpdatedAt?: number): Task {
     return this.#transaction(() => {
       const row = this.#requireRow(taskId)
+      // Checked inside the write transaction, so no other writer can slip in between the check and
+      // the write. `updated_at` is the token because every change to a card stamps it; the whole
+      // board's revision would conflict on edits to unrelated cards.
+      if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== row.updated_at) {
+        throw new TaskConflictError(row.ref)
+      }
       const sets: string[] = []
       const params: (string | number | null)[] = []
       let changed = false
@@ -746,7 +1001,6 @@ export class TaskStore {
       sets.push('updated_at = ?')
       params.push(now)
       this.#prepare(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`).run(...params, taskId)
-      this.#bump()
       return toTask(this.#requireRow(taskId))
     })
   }
@@ -773,7 +1027,6 @@ export class TaskStore {
       this.#prepare('UPDATE tasks SET archived = ?, archived_at = ?, rank = ?, updated_at = ? WHERE id = ?')
         .run(archived ? 1 : 0, archived ? now : null, rank, now, taskId)
       this.#log(taskId, archived ? 'archived' : 'restored', author, now)
-      this.#bump()
       return toTask(this.#requireRow(taskId))
     })
   }
@@ -789,7 +1042,6 @@ export class TaskStore {
       // Comments and activity carry ON DELETE CASCADE, and `PRAGMA foreign_keys = ON` is applied at
       // open, so this one statement takes the whole card with it.
       this.#prepare('DELETE FROM tasks WHERE id = ?').run(taskId)
-      this.#bump()
     })
   }
 
@@ -812,7 +1064,6 @@ export class TaskStore {
       ).run(id, taskId, text, author.actor, now, now)
       this.#log(taskId, 'comment', author, now, undefined, text.split('\n')[0])
       this.#prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now, taskId)
-      this.#bump()
       return toComment(this.#requireComment(id))
     })
   }
@@ -833,7 +1084,6 @@ export class TaskStore {
       if (row.body === text) return toComment(row)
       this.#prepare('UPDATE comments SET body = ?, updated_at = ? WHERE id = ?').run(text, now, commentId)
       this.#prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now, row.task_id)
-      this.#bump()
       return toComment(this.#requireComment(commentId))
     })
   }
@@ -850,71 +1100,206 @@ export class TaskStore {
       if (row === undefined) throw new TaskNotFoundError('comment', commentId)
       this.#prepare('DELETE FROM comments WHERE id = ?').run(commentId)
       this.#prepare('UPDATE tasks SET updated_at = ? WHERE id = ?').run(now, row.task_id)
-      this.#bump()
     })
   }
 
   /**
    * Mark a card as being worked by a background job.
+   *
+   * The claim is conditional on the card not already carrying a run, inside the write transaction,
+   * so two processes dispatching the same card at once cannot both succeed: the loser learns at once
+   * and can stop the job it just started.
    * @param taskId - the card.
    * @param jobId - the job registry's id for the run.
+   * @param owner - the process and session that own the run.
    * @param author - who dispatched it and from where.
    * @param now - epoch ms to stamp.
    * @returns the card carrying its running job.
    * @throws TaskNotFoundError when the board has no such card.
+   * @throws TaskValidationError when another run already holds the card.
    */
-  startRun(taskId: string, jobId: string, author: TaskAuthor, now: number): Task {
+  startRun(taskId: string, jobId: string, owner: RunOwner, author: TaskAuthor, now: number): Task {
     return this.#transaction(() => {
-      this.#requireRow(taskId)
-      this.#prepare('UPDATE tasks SET running_job_id = ?, updated_at = ? WHERE id = ?').run(jobId, now, taskId)
+      const row = this.#requireRow(taskId)
+      if (row.running_job_id !== null) {
+        throw new TaskValidationError(`#${row.ref} is already running as job ${row.running_job_id}`)
+      }
+      this.#prepare('UPDATE tasks SET running_job_id = ?, run_owner = ?, updated_at = ? WHERE id = ?')
+        .run(jobId, JSON.stringify(owner), now, taskId)
       this.#log(taskId, 'run-started', author, now, undefined, jobId)
-      this.#bump()
       return toTask(this.#requireRow(taskId))
     })
   }
 
   /**
-   * Record how a dispatched run ended and clear the card's running state.
+   * Record how a dispatched run ended.
+   *
+   * The card's running state is cleared only when the marker still names THIS run: the same job id
+   * AND the same owner process. Job ids are counters local to one process (`task-1` exists in every
+   * dsh process that has dispatched anything), so the id alone would let one process's settlement
+   * clear a marker another process holds for its own, unrelated run.
+   *
+   * A settlement whose marker is gone or replaced still tells the truth in the history, and fills
+   * `last_run` when nothing newer holds the card — the real outcome is better than the "interrupted"
+   * a sweep recorded while the run was out of reach.
    *
    * Tolerates a card that vanished while its job ran — deleting a card mid-run is a thing a person
    * may reasonably do, and the job's settlement must not then throw inside the registry's listener.
    * @param taskId - the card.
    * @param summary - the run's outcome.
+   * @param owner - the process that started the run.
    * @param author - who to attribute the transition to; normally `system`.
    * @param now - epoch ms to stamp.
-   * @returns the card, or `undefined` when it is no longer on the board.
+   * @param effects - the report to leave and the column to move to, applied in the same transaction.
+   * @returns the card and whether the run was still current, or `undefined` when the card is gone.
    */
-  finishRun(taskId: string, summary: TaskRunSummary, author: TaskAuthor, now: number): Task | undefined {
+  finishRun(
+    taskId: string,
+    summary: TaskRunSummary,
+    owner: RunOwner,
+    author: TaskAuthor,
+    now: number,
+    effects: RunSettlementEffects = {},
+  ): FinishedRun | undefined {
     return this.#transaction(() => {
-      const row = one<{ id: string }>(this.#prepare('SELECT id FROM tasks WHERE id = ?'), taskId)
+      const row = one<TaskRow>(this.#prepare('SELECT * FROM tasks WHERE id = ?'), taskId)
       if (row === undefined) return undefined
-      this.#prepare('UPDATE tasks SET running_job_id = NULL, last_run = ?, updated_at = ? WHERE id = ?')
-        .run(JSON.stringify(summary), now, taskId)
+      const current = row.running_job_id === summary.jobId
+        && decodeRunOwner(row.run_owner)?.instance === owner.instance
+      if (current) {
+        this.#prepare('UPDATE tasks SET running_job_id = NULL, run_owner = NULL, last_run = ?, updated_at = ? WHERE id = ?')
+          .run(JSON.stringify(summary), now, taskId)
+      } else if (row.running_job_id === null) {
+        this.#prepare('UPDATE tasks SET last_run = ?, updated_at = ? WHERE id = ?').run(JSON.stringify(summary), now, taskId)
+      }
       this.#log(taskId, 'run-finished', author, now, summary.jobId, summary.status)
-      this.#bump()
+      // The report is the run's work product, so it is kept even when a newer run holds the card; the
+      // automatic column move is not, because the card's state now belongs to that newer run.
+      if (effects.report !== undefined) this.addComment(taskId, effects.report, author, now)
+      if (current && effects.completedStatus !== undefined) {
+        this.update(taskId, { status: effects.completedStatus }, author, now)
+      }
+      return { task: toTask(this.#requireRow(taskId)), current }
+    })
+  }
+
+  /**
+   * Every running marker on the board.
+   * @returns the markers, at most {@link MAX_QUERY_LIMIT} of them.
+   */
+  runMarkers(): RunMarker[] {
+    return this.#markerRows().flatMap((row) => {
+      const marker = toMarker(row)
+      return marker === undefined ? [] : [marker]
+    })
+  }
+
+  /**
+   * The rows carrying a running marker.
+   * @returns the rows, bounded.
+   */
+  #markerRows(): TaskRow[] {
+    return many<TaskRow>(
+      this.#prepare('SELECT * FROM tasks WHERE running_job_id IS NOT NULL ORDER BY id LIMIT ?'),
+      MAX_QUERY_LIMIT,
+    )
+  }
+
+  /**
+   * One card's running marker.
+   * @param taskId - the card.
+   * @returns the marker, or `undefined` when the card is idle.
+   * @throws TaskNotFoundError when the board has no such card.
+   */
+  runMarker(taskId: string): RunMarker | undefined {
+    return toMarker(this.#requireRow(taskId))
+  }
+
+  /**
+   * Settle every running marker its judge says is no longer live.
+   *
+   * Jobs live in memory only, so a card left running by a process that exited mid-run shows a job
+   * that can never settle — and Dispatch refuses it as "already running" — until something clears
+   * it. Which markers are stale is the judge's call, because only the service can ask the job
+   * registry about runs this process owns; see {@link judgeRunByProcess} for the default.
+   *
+   * The markers are judged outside the write lock, and each write is conditional on the marker
+   * being unchanged, so a run settled or re-dispatched while the sweep was judging is left alone.
+   * @param judge - decides each marker's fate.
+   * @param now - epoch ms to stamp on the cards it changes.
+   * @returns how many markers were cleared.
+   */
+  reconcileRuns(judge: RunJudge, now: number): number {
+    const decisions = this.#markerRows().flatMap((row) => {
+      const marker = toMarker(row)
+      if (marker === undefined) return []
+      const verdict = judge(marker)
+      return verdict.kind === 'live' ? [] : [{ row, verdict }]
+    })
+    if (decisions.length === 0) return 0
+    return this.#transaction(() => {
+      let cleared = 0
+      for (const { row, verdict } of decisions) {
+        if (this.#settleStale(row, verdict, now)) cleared++
+      }
+      return cleared
+    })
+  }
+
+  /**
+   * Settle one card's running marker if its judge says it is no longer live.
+   * @param taskId - the card.
+   * @param judge - decides the marker's fate.
+   * @param now - epoch ms to stamp.
+   * @returns the card as it now stands.
+   * @throws TaskNotFoundError when the board has no such card.
+   */
+  reconcileRun(taskId: string, judge: RunJudge, now: number): Task {
+    const row = this.#requireRow(taskId)
+    const marker = toMarker(row)
+    if (marker === undefined) return toTask(row)
+    const verdict = judge(marker)
+    if (verdict.kind === 'live') return toTask(row)
+    return this.#transaction(() => {
+      this.#settleStale(row, verdict, now)
       return toTask(this.#requireRow(taskId))
     })
   }
 
   /**
-   * Clear every stale running marker.
-   *
-   * Jobs live in memory only, so a card left `running` by a process that exited mid-run would show
-   * a job that can never settle. Called once when a board is opened.
-   * @param now - epoch ms to stamp on the cards it clears.
-   * @returns how many cards were cleared.
+   * Clear one stale marker, provided it is still the marker that was judged. Runs inside the
+   * caller's transaction.
+   * @param judged - the row as it was when judged.
+   * @param verdict - the non-live verdict.
+   * @param now - epoch ms to stamp.
+   * @returns whether the marker was still in place and has been cleared.
    */
-  clearStaleRuns(now: number): number {
-    return this.#transaction(() => {
-      const rows = many<{ id: string }>(this.#prepare('SELECT id FROM tasks WHERE running_job_id IS NOT NULL'))
-      if (rows.length === 0) return 0
-      this.#prepare('UPDATE tasks SET running_job_id = NULL, updated_at = ? WHERE running_job_id IS NOT NULL').run(now)
-      for (const row of rows) {
-        this.#log(row.id, 'run-finished', { actor: 'system' }, now, undefined, 'interrupted')
-      }
-      this.#bump()
-      return rows.length
-    })
+  #settleStale(judged: TaskRow, verdict: Exclude<RunVerdict, { kind: 'live' }>, now: number): boolean {
+    const lastRun = verdict.kind === 'settled' ? JSON.stringify(verdict.summary) : judged.last_run
+    const result = this.#prepare(`
+      UPDATE tasks SET running_job_id = NULL, run_owner = NULL, last_run = ?, updated_at = ?
+      WHERE id = ? AND running_job_id IS ? AND run_owner IS ?
+    `).run(lastRun, now, judged.id, judged.running_job_id, judged.run_owner)
+    if (result.changes === 0) return false
+    const status = verdict.kind === 'settled' ? verdict.summary.status : 'interrupted'
+    this.#log(judged.id, 'run-finished', { actor: 'system' }, now, judged.running_job_id ?? undefined, status)
+    return true
+  }
+
+  /**
+   * How many comments each of a set of cards carries, in one query.
+   * @param taskIds - the cards to count for; at most {@link MAX_QUERY_LIMIT} are counted.
+   * @returns counts by card id; a card with no comments is absent.
+   */
+  commentCounts(taskIds: readonly string[]): ReadonlyMap<string, number> {
+    if (taskIds.length === 0) return new Map()
+    // One bound JSON array rather than one placeholder per id: a single fixed statement, however many
+    // cards a list returned, and nothing a caller sends is spliced into the SQL.
+    const rows = many<{ task_id: string; n: number }>(
+      this.#prepare('SELECT task_id, COUNT(*) AS n FROM comments WHERE task_id IN (SELECT value FROM json_each(?)) GROUP BY task_id'),
+      JSON.stringify(taskIds.slice(0, MAX_QUERY_LIMIT)),
+    )
+    return new Map(rows.map(row => [row.task_id, row.n]))
   }
 
   /**
@@ -966,26 +1351,7 @@ function formatDue(value: number | null): string | undefined {
 }
 
 /**
- * Boards whose stranded run markers this process has already swept.
- *
- * Process-wide, so a settings rebuild, a plugin reload, or a second copy of this module does not
- * sweep again. A second sweep would clear the markers of runs this very process started and is
- * still running, and the board would call live work "interrupted".
- */
-const SWEPT_KEY = Symbol.for('@achasoft/dsh-tasks-manager/swept-boards')
-
-/**
- * The sweep table.
- * @returns the set of canonical board paths already swept, created on first use.
- */
-function sweptBoards(): Set<string> {
-  const holder = globalThis as { [SWEPT_KEY]?: Set<string> }
-  holder[SWEPT_KEY] ??= new Set()
-  return holder[SWEPT_KEY]
-}
-
-/**
- * One open board per database file, for the process's lifetime.
+ * One open board per database file, for the registry's lifetime.
  *
  * Boards are keyed by the canonical database path rather than opened per call: SQLite handles are
  * cheap to keep and expensive to churn, and two handles on one WAL database in one process would
@@ -995,20 +1361,29 @@ export class TaskStoreRegistry {
   readonly #stores = new Map<string, TaskStore>()
   readonly #options: TaskStoreOptions
   readonly #databasePath: string
+  readonly #judge: RunJudge
 
   /**
    * @param databasePath - the configured database path; relative paths resolve per project root.
    * @param options - the deployment's board behaviour, shared by every board.
+   * @param judge - decides which running markers are stale when a board is opened.
    */
-  constructor(databasePath: string, options: TaskStoreOptions) {
+  constructor(databasePath: string, options: TaskStoreOptions, judge: RunJudge = judgeRunByProcess) {
     this.#databasePath = databasePath
     this.#options = options
+    this.#judge = judge
   }
 
   /**
    * The board for one project, opening it on first use.
+   *
+   * Every first open reconciles the board's running markers — including the reopen a settings
+   * rebuild or a plugin reload performs. That used to be unsafe, because the sweep could not tell
+   * this process's live runs from dead ones and so ran once per process; with owners on the markers
+   * and a judge that asks the job registry, a reopen is exactly when a marker stranded by a lost
+   * settlement should be found.
    * @param projectRoot - absolute path of the project.
-   * @param now - epoch ms, used to clear runs stranded by a previous process.
+   * @param now - epoch ms, used to stamp markers the sweep clears.
    * @returns the project's board.
    */
   open(projectRoot: string, now: number): TaskStore {
@@ -1016,11 +1391,7 @@ export class TaskStoreRegistry {
     let store = this.#stores.get(path)
     if (store === undefined) {
       store = new TaskStore(path, this.#options)
-      const swept = sweptBoards()
-      if (path === ':memory:' || !swept.has(path)) {
-        store.clearStaleRuns(now)
-        swept.add(path)
-      }
+      store.reconcileRuns(this.#judge, now)
       this.#stores.set(path, store)
     }
     return store
@@ -1028,9 +1399,6 @@ export class TaskStoreRegistry {
 
   /**
    * A board already open at one database path.
-   *
-   * Used by settlement paths that hold a path rather than a project root and must not open a board
-   * that has since been closed — a background run outliving its board is ordinary at shutdown.
    * @param path - the absolute database path.
    * @returns the open board, or `undefined` when none is open at that path.
    */
@@ -1038,7 +1406,29 @@ export class TaskStoreRegistry {
     return this.#stores.get(path)
   }
 
-  /** Close every open board. */
+  /**
+   * Run some work against the board at a database path, whether or not this registry has it open.
+   *
+   * For settlement. A background run outlives the registry that was current when it started — a
+   * settings save rebuilds the registry, a plugin reload replaces the whole service — and its outcome
+   * must still reach its card. The open board is used when there is one; otherwise a handle is
+   * opened for the work and closed straight after, so a closed registry never keeps a file open.
+   * @param path - the canonical database path the run recorded.
+   * @param work - what to do with the board.
+   * @returns whatever `work` returned.
+   */
+  withBoardAt<T>(path: string, work: (board: TaskStore) => T): T {
+    const open = this.#stores.get(path)
+    if (open !== undefined) return work(open)
+    const transient = new TaskStore(path, this.#options)
+    try {
+      return work(transient)
+    } finally {
+      transient.close()
+    }
+  }
+
+  /** Close every open board. The registry still serves {@link withBoardAt} afterwards. */
   close(): void {
     for (const store of this.#stores.values()) store.close()
     this.#stores.clear()

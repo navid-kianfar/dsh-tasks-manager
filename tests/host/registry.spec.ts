@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { TaskStoreRegistry, type TaskStoreOptions } from '../../src/host/store.ts'
+import { currentRunOwner } from '../../src/host/run-owner.ts'
 
 const OPTIONS: TaskStoreOptions = {
   newTaskPlacement: 'top',
@@ -56,13 +57,46 @@ describe('TaskStoreRegistry', () => {
     const before = registry()
     const board = before.open(project, 1)
     const task = board.create({ title: 'running card' }, { actor: 'user' }, 2)
-    board.startRun(task.id, 'job-1', { actor: 'user' }, 3)
+    board.startRun(task.id, 'job-1', currentRunOwner('s1'), { actor: 'user' }, 3)
 
     // What a settings change does: close every board and build a fresh registry in the same process.
     before.close()
     const after = registry().open(project, 4)
 
     expect(after.detail(task.id).task.runningJobId).toBe('job-1')
+  })
+
+  it('settles a run on a board its registry has since closed', () => {
+    const before = registry()
+    const board = before.open(project, 1)
+    const task = board.create({ title: 'running card' }, { actor: 'user' }, 2)
+    const owner = currentRunOwner('s1')
+    board.startRun(task.id, 'job-1', owner, { actor: 'user' }, 3)
+    const path = board.databasePath
+    before.close()
+
+    // The settlement arrives after the rebuild, addressed by the path the run recorded.
+    const settled = before.withBoardAt(path, open =>
+      open.finishRun(task.id, { jobId: 'job-1', status: 'completed', startedAt: 3, finishedAt: 4 }, owner, { actor: 'system' }, 4))
+
+    expect(settled?.current).toBe(true)
+    const reopened = registry().open(project, 5)
+    expect(reopened.detail(task.id).task.runningJobId).toBeUndefined()
+    expect(reopened.detail(task.id).task.lastRun?.status).toBe('completed')
+  })
+
+  it('re-judges running markers every time a registry opens a board', () => {
+    const first = registry()
+    const board = first.open(project, 1)
+    const task = board.create({ title: 'card' }, { actor: 'user' }, 2)
+    board.startRun(task.id, 'job-1', currentRunOwner('s1'), { actor: 'user' }, 3)
+    first.close()
+
+    // A second registry in the same process — a rebuild — whose judge now knows the run is over.
+    const second = new TaskStoreRegistry('.dsh/tasks.db', OPTIONS, () => ({ kind: 'interrupted' }))
+    registries.push(second)
+
+    expect(second.open(project, 4).detail(task.id).task.runningJobId).toBeUndefined()
   })
 
   it('folds the write-ahead log into the main file on close', () => {

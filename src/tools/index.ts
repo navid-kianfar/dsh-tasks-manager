@@ -106,17 +106,23 @@ function toDateText(at: number): string {
 
 /**
  * Parse a model-supplied calendar date.
+ *
+ * The shape check alone is not enough: `Date.parse` rolls an impossible day over rather than
+ * failing, so `2026-02-31` would be stored as 3 March. The parsed date is therefore rendered back
+ * and must be the text the model sent.
  * @param text - a `YYYY-MM-DD` date, or the empty string to clear one.
  * @returns epoch ms at UTC midnight, or `null` to clear.
  * @throws TaskValidationError when the text is not a real calendar date.
  */
-function parseDateText(text: string): number | null {
+export function parseDateText(text: string): number | null {
   if (text.trim() === '') return null
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(text)) {
     throw new TaskValidationError(`dueDate must be a YYYY-MM-DD date (got ${JSON.stringify(text)})`)
   }
   const at = Date.parse(`${text}T00:00:00.000Z`)
-  if (Number.isNaN(at)) throw new TaskValidationError(`${JSON.stringify(text)} is not a real date`)
+  if (Number.isNaN(at) || toDateText(at) !== text) {
+    throw new TaskValidationError(`${JSON.stringify(text)} is not a real calendar date`)
+  }
   return at
 }
 
@@ -159,14 +165,16 @@ function resolveTask(board: TaskStore, reference: string): Task {
 
 /**
  * How many comments each of a set of cards carries.
+ *
+ * One grouped query for the whole list. Reading each card's detail to count its comments was two
+ * queries per card, and a `task_list` may return up to 2000 cards.
  * @param board - the project's board.
  * @param tasks - the cards to count for.
- * @returns comment counts by card id.
+ * @returns comment counts by card id; a card with none is absent.
  */
-function commentCounts(board: TaskStore, tasks: readonly Task[]): Map<string, number> {
-  const counts = new Map<string, number>()
-  for (const task of tasks) counts.set(task.id, board.detail(task.id).comments.length)
-  return counts
+function commentCounts(board: TaskStore, tasks: readonly Task[]): ReadonlyMap<string, number> {
+  const ids = tasks.map(task => task.id)
+  return board.commentCounts(ids)
 }
 
 /** Schema fragment for the status enum, shared by the tools that accept one. */
@@ -246,20 +254,23 @@ export function apply(ctx: Context, config: Config): void {
     execute(args, exec) {
       const { board, author } = boardOf(ctx, exec)
       const now = Date.now()
-      const added = args.tasks.map((input) => {
-        const create: TaskCreate = {
+      // Every input is turned into a create before anything is written, and the batch is written in
+      // one transaction: a bad date on the third task must not leave the first two on the board for
+      // a retry to duplicate.
+      const creates: readonly TaskCreate[] = args.tasks.map((input) => {
+        const dueAt = input.dueDate === undefined ? null : parseDateText(input.dueDate)
+        return {
           title: input.title,
           ...input.body === undefined ? {} : { body: input.body },
           ...input.status === undefined ? {} : { status: input.status as TaskStatus },
           ...input.priority === undefined ? {} : { priority: input.priority as Task['priority'] },
           ...input.labels === undefined ? {} : { labels: input.labels },
           ...input.assignee === undefined ? {} : { assignee: input.assignee },
-          ...input.dueDate === undefined || parseDateText(input.dueDate) === null
-            ? {}
-            : { dueAt: parseDateText(input.dueDate) as number },
+          ...dueAt === null ? {} : { dueAt },
         }
-        return toLine(board.create(create, author, now), 0)
       })
+      const created = board.createMany(creates, author, now)
+      const added = created.map(task => toLine(task, 0))
       return Promise.resolve({ added, boardPath: board.databasePath })
     },
     presentCall: args => ({
@@ -487,11 +498,11 @@ export function apply(ctx: Context, config: Config): void {
       }],
     },
     execute(args, exec) {
-      const { board, author } = boardOf(ctx, exec)
+      const { board } = boardOf(ctx, exec)
       const target = resolveTask(board, args.task)
       // Through the service, not `board.remove`: a dispatched card owns a live subagent, and the
       // deletion path is what stops it.
-      ctx.tasks.removeTask(board, target.id, author.sessionId ?? '')
+      ctx.tasks.removeTask(board, target.id)
       return Promise.resolve({ ref: target.ref, title: target.title, deleted: true })
     },
     presentCall: args => ({ card: 'generic', title: `Delete task ${args.task}`, kind: 'other', rawInput: args }),

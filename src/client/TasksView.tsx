@@ -64,6 +64,26 @@ export type TasksViewProps = {
 const FALLBACK_POLL_MS = 2000
 
 /**
+ * The confirmation shown before a card is deleted.
+ *
+ * Both lines are given the card's number: a dictionary may name it in either (the Chinese
+ * description does), and a placeholder left unfilled renders as a literal `{ref}`.
+ * @param t - translate, bound to this plugin's namespace.
+ * @param ref - the card's display number, or `undefined` when the card is not in the loaded view.
+ * @param onConfirm - what confirming does.
+ * @returns the dialog request.
+ */
+export function deleteConfirmation(t: BoardTranslate, ref: number | undefined, onConfirm: () => void): ConfirmRequest {
+  const params = { ref: ref ?? '' }
+  return {
+    title: t('confirm.deleteTitle', params),
+    description: t('confirm.delete', params),
+    confirmLabel: t('confirm.deleteAction'),
+    onConfirm,
+  }
+}
+
+/**
  * Sort cards the way the board renders them: by column, then by rank inside it.
  *
  * Applied after an optimistic single-card update so a dragged card lands in its new place
@@ -109,6 +129,14 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
 
   const revision = useRef(-1)
   const alive = useRef(true)
+  /**
+   * Field edits run one after another. Each carries the card's `updatedAt` as a precondition, and
+   * two edits sent together would carry the same one — the second then conflicts with the first,
+   * the person's own edit. Chained, each sends the stamp its predecessor returned.
+   */
+  const edits = useRef<Promise<void>>(Promise.resolve())
+  /** The newest `updatedAt` this view has seen per card, from reads and from its own writes. */
+  const stamps = useRef(new Map<string, number>())
   useEffect(() => {
     alive.current = true
     return () => { alive.current = false }
@@ -128,6 +156,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     try {
       const result = await api.call('board.read', { sessionId, query: next })
       if (!alive.current) return
+      for (const task of result.tasks) stamps.current.set(task.id, task.updatedAt)
       setView(result)
       setError(null)
     } catch (cause) {
@@ -164,7 +193,9 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     setDetailLoading(true)
     try {
       const result = await api.call('task.detail', { sessionId, taskId })
-      if (alive.current) setDetail(result)
+      if (!alive.current) return
+      stamps.current.set(result.task.id, result.task.updatedAt)
+      setDetail(result)
     } catch (cause) {
       if (!alive.current) return
       // The card is gone (another session deleted it); close rather than stranding an empty panel.
@@ -234,12 +265,14 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
       await work()
     } catch (cause) {
       if (alive.current) setError(explain(cause))
-      // The local view may now disagree with the store, so re-read rather than leaving it wrong.
+      // The local view may now disagree with the store — a refused edit most of all, whose card
+      // someone else changed — so re-read the board and the open card rather than leaving either wrong.
       await loadBoard(query)
+      if (openId !== undefined) await loadDetail(openId)
     } finally {
       if (alive.current) setBusy(false)
     }
-  }, [explain, loadBoard, query])
+  }, [explain, loadBoard, loadDetail, query, openId])
 
   /**
    * Fold one server-returned card into the local board without a full re-read.
@@ -249,6 +282,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
    * @param task - the updated card.
    */
   const applyTask = useCallback((task: BoardView['tasks'][number]): void => {
+    stamps.current.set(task.id, task.updatedAt)
     setView((current) => {
       if (current === null) return current
       const archivedFilter = query.archived ?? 'active'
@@ -260,10 +294,16 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
   }, [query.archived])
 
   const patch = useCallback((taskId: string, value: TaskPatch) => {
-    void mutate(async () => {
-      applyTask(await api.call('task.update', { sessionId, taskId, patch: value }))
+    const next = edits.current.then(() => mutate(async () => {
+      const expectedUpdatedAt = stamps.current.get(taskId)
+      const request = expectedUpdatedAt === undefined
+        ? { sessionId, taskId, patch: value }
+        : { sessionId, taskId, patch: value, expectedUpdatedAt }
+      applyTask(await api.call('task.update', request))
       if (openId === taskId) await loadDetail(taskId)
-    })
+    }))
+    edits.current = next
+    void next
   }, [mutate, applyTask, api, sessionId, openId, loadDetail])
 
   const promote = useCallback((content: string) => {
@@ -297,18 +337,13 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
 
   const remove = useCallback((taskId: string) => {
     const target = view?.tasks.find(entry => entry.id === taskId)
-    setConfirming({
-      title: t('confirm.deleteTitle', { ref: target?.ref ?? '' }),
-      description: t('confirm.delete'),
-      confirmLabel: t('confirm.deleteAction'),
-      onConfirm: () => {
-        void mutate(async () => {
-          await api.call('task.delete', { sessionId, taskId })
-          if (openId === taskId) setOpenId(undefined)
-          await loadBoard(query)
-        })
-      },
-    })
+    setConfirming(deleteConfirmation(t, target?.ref, () => {
+      void mutate(async () => {
+        await api.call('task.delete', { sessionId, taskId })
+        if (openId === taskId) setOpenId(undefined)
+        await loadBoard(query)
+      })
+    }))
   }, [view, t, mutate, api, sessionId, openId, loadBoard, query])
 
   const dispatch = useCallback((taskId: string) => {
@@ -330,12 +365,14 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     void mutate(async () => {
       const result = await api.call('jobs.read', { sessionId, jobId })
       if (!alive.current) return
-      // Deltas accumulate: the registry's read consumes, so discarding the previous text would lose
-      // output no second read can return.
-      setJobOutput(current => ({ ...current, [jobId]: (current[jobId] ?? '') + result.text }))
+      // Replaced, not appended: the host never consumes a job's output for the board (see `readJob`),
+      // so each read is the whole answer — a card run's final output, or a note that the output is
+      // the agent's to read.
+      const text = result.outputWithheld === true ? t('jobs.outputWithheld') : result.text
+      setJobOutput(current => ({ ...current, [jobId]: text }))
       await loadJobs()
     })
-  }, [mutate, api, sessionId, loadJobs])
+  }, [mutate, api, sessionId, loadJobs, t])
 
   const jobKill = useCallback((jobId: string) => {
     void mutate(async () => {
