@@ -68,6 +68,12 @@ export function TaskDetail({
 }: TaskDetailProps) {
   const [editingBody, setEditingBody] = useState(false)
   const [bodyDraft, setBodyDraft] = useState('')
+  /**
+   * The card's `updatedAt` when the title or the body editor was entered. Refs, not the rendered
+   * card: a poll re-renders the panel mid-edit, and the commit must carry what the person started from.
+   */
+  const titleSeen = useRef(0)
+  const bodySeen = useRef(0)
   const [editingComment, setEditingComment] = useState<string | undefined>(undefined)
   const [showActivity, setShowActivity] = useState(false)
   const [comment, setComment] = useState('')
@@ -131,6 +137,7 @@ export function TaskDetail({
           key={`${task.id}:${task.title}`}
           placeholder={t('detail.titlePlaceholder')}
           aria-label={t('detail.titlePlaceholder')}
+          onFocus={() => { titleSeen.current = task.updatedAt }}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
               event.currentTarget.value = task.title
@@ -141,7 +148,7 @@ export function TaskDetail({
           }}
           onBlur={(event) => {
             const next = event.currentTarget.value.trim()
-            if (next !== '' && next !== task.title) onTitleChange(task.id, next)
+            if (next !== '' && next !== task.title) onTitleChange(task.id, next, titleSeen.current)
             else event.currentTarget.value = task.title
           }}
         />
@@ -225,7 +232,7 @@ export function TaskDetail({
               <button
                 type="button"
                 className={css.link}
-                onClick={() => { setBodyDraft(task.body); setEditingBody(true) }}
+                onClick={() => { bodySeen.current = task.updatedAt; setBodyDraft(task.body); setEditingBody(true) }}
               >
                 {t('detail.edit')}
               </button>
@@ -244,7 +251,7 @@ export function TaskDetail({
                       if (event.key === 'Escape') { event.preventDefault(); setEditingBody(false); return }
                       if (!isCommit(event)) return
                       event.preventDefault()
-                      onBodyChange(task.id, bodyDraft)
+                      onBodyChange(task.id, bodyDraft, bodySeen.current)
                       setEditingBody(false)
                     }}
                   />
@@ -254,7 +261,7 @@ export function TaskDetail({
                     <Button
                       size="sm"
                       variant="primary"
-                      onClick={() => { onBodyChange(task.id, bodyDraft); setEditingBody(false) }}
+                      onClick={() => { onBodyChange(task.id, bodyDraft, bodySeen.current); setEditingBody(false) }}
                     >
                       {t('detail.save')}
                     </Button>

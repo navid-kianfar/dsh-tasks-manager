@@ -98,6 +98,13 @@ export interface TaskMoveRequest extends SessionScoped {
   status: TaskStatus
   /** Where in that column it landed, as its new neighbours. */
   place: TaskPlacement
+  /**
+   * The card's `updatedAt` as the person saw it when the move began. When sent, the move is refused
+   * with a `bad-request` saying the card changed if anyone has changed it since, exactly as
+   * {@link TaskUpdateRequest.expectedUpdatedAt} refuses an edit. Optional, so an older client still
+   * moves unconditionally.
+   */
+  expectedUpdatedAt?: number
 }
 
 /** `task.archive` and `task.restore` — hide a card from the board, or bring it back. */

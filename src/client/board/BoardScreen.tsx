@@ -11,7 +11,6 @@
 import { useEffect, useRef, useState } from 'react'
 import clsx from 'clsx'
 import { Button, IconPlusOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { TaskStatus } from '../../domain/types.ts'
 import type { BoardEmptyProps, BoardMode, BoardScreenProps, SortState } from './contract.ts'
 import { Background } from './Background.tsx'
 import { SessionTodos } from './SessionTodos.tsx'
@@ -19,7 +18,7 @@ import { Kanban } from './Kanban.tsx'
 import { ListView } from './ListView.tsx'
 import { TaskDetail } from './TaskDetail.tsx'
 import { Toolbar } from './Toolbar.tsx'
-import { activeFilterCount, collectLabels } from './format.ts'
+import { activeFilterCount, collectLabels, composerStatus } from './format.ts'
 import fields from './fields.module.css'
 import css from './BoardScreen.module.css'
 
@@ -40,7 +39,7 @@ export function BoardEmpty({ filtered, onAction, t }: BoardEmptyProps) {
 export function BoardScreen({
   view, error, busy, query, onQueryChange, detail, detailLoading, jobs, jobOutput,
   todos, promoted, onPromote, canDispatch, canDelete, assignees, assigneesAvailable,
-  onRefresh, onCreate, detailActions, taskActions, onJobRead, onJobKill, t,
+  onRefresh, onCreate, defaultStatus, detailActions, taskActions, onJobRead, onJobKill, t,
 }: BoardScreenProps) {
   const [mode, setMode] = useState<BoardMode>('kanban')
   const [sort, setSort] = useState<SortState>({ column: 'updatedAt', direction: 'desc' })
@@ -112,9 +111,9 @@ export function BoardScreen({
               event.preventDefault()
               const title = event.currentTarget.value.trim()
               if (title === '') return
-              // A card typed into the board's own composer lands in the first column, which is
-              // where a person who has not chosen a column expects intake to go.
-              onCreate(title, (query.status?.[0] ?? 'backlog') as TaskStatus)
+              // The composer is in no column, so the configured default decides where intake goes;
+              // a column's own quick-add below passes that column instead.
+              onCreate(title, composerStatus(query.status, defaultStatus))
               event.currentTarget.value = ''
             }}
             onBlur={() => { setComposing(false) }}

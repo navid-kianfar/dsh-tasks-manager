@@ -70,7 +70,11 @@ function view(tasks: Task[]): BoardView {
  * @param over - props to override.
  * @returns the mounted container and the spies the test asserts on.
  */
-function render(over: Partial<BoardScreenProps> = {}): { container: HTMLElement; onCreate: ReturnType<typeof vi.fn> } {
+function render(over: Partial<BoardScreenProps> = {}): {
+  container: HTMLElement
+  onCreate: ReturnType<typeof vi.fn>
+  rerender: (next: Partial<BoardScreenProps>) => void
+} {
   const onCreate = vi.fn()
   const props: BoardScreenProps = {
     view: view([]),
@@ -110,7 +114,11 @@ function render(over: Partial<BoardScreenProps> = {}): { container: HTMLElement;
   document.body.append(host)
   root = createRoot(host)
   act(() => { root?.render(<BoardScreen {...props} />) })
-  return { container: host, onCreate }
+  // Re-renders the same mounted tree with changed props, as a poll delivering a fresher read does.
+  const rerender = (next: Partial<BoardScreenProps>): void => {
+    act(() => { root?.render(<BoardScreen {...props} {...next} />) })
+  }
+  return { container: host, onCreate, rerender }
 }
 
 describe('BoardScreen', () => {
@@ -164,8 +172,8 @@ describe('BoardScreen', () => {
     expect(container.querySelector('article[data-task-id]')?.textContent).not.toContain('priority.normal')
   })
 
-  it('creates a task from the composer and clears it for the next one', () => {
-    const { container, onCreate } = render({ view: view([task({ ref: 1 })]) })
+  it('creates a task from the composer in the configured default column and clears it for the next one', () => {
+    const { container, onCreate } = render({ view: view([task({ ref: 1 })]), defaultStatus: 'todo' })
     const openComposer = [...container.querySelectorAll('button')]
       .find(node => node.textContent === 'board.newTask')
     act(() => { openComposer?.click() })
@@ -176,8 +184,47 @@ describe('BoardScreen', () => {
       (input as HTMLInputElement).value = '  a fresh task  '
       input?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     })
-    expect(onCreate).toHaveBeenCalledWith('a fresh task', 'backlog')
+    expect(onCreate).toHaveBeenCalledWith('a fresh task', 'todo')
     expect(input?.value).toBe('')
+  })
+
+  it('leaves the column to the host when the settings have not been read yet', () => {
+    const { container, onCreate } = render({ view: view([task({ ref: 1 })]) })
+    act(() => {
+      [...container.querySelectorAll('button')].find(node => node.textContent === 'board.newTask')?.click()
+    })
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="compose.newTaskTitle"]')
+    act(() => {
+      (input as HTMLInputElement).value = 'intake'
+      input?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    })
+    expect(onCreate).toHaveBeenCalledWith('intake', undefined)
+  })
+
+  it('commits a title edit against the stamp the card had when editing began, not a later refresh', () => {
+    const onTitleChange = vi.fn()
+    const card = task({ ref: 4, title: 'before', updatedAt: 500 })
+    const detailActions = {
+      onClose: vi.fn(), onTitleChange, onBodyChange: vi.fn(), onStatusChange: vi.fn(),
+      onPriorityChange: vi.fn(), onLabelsChange: vi.fn(), onAssigneeChange: vi.fn(), onDueChange: vi.fn(),
+      onArchive: vi.fn(), onDelete: vi.fn(), onDispatch: vi.fn(), onStopRun: vi.fn(),
+      onComment: vi.fn(), onCommentEdit: vi.fn(), onCommentDelete: vi.fn(),
+    }
+    const { container, rerender } = render({
+      view: view([card]), detail: { task: card, comments: [], activity: [] }, detailActions,
+    })
+    const title = container.querySelector<HTMLInputElement>('input[aria-label="detail.titlePlaceholder"]')
+    act(() => { title?.focus() })
+
+    // A poll lands while the person types: someone else changed another field of the card.
+    const refreshed = { ...card, priority: 'high' as const, updatedAt: 900 }
+    rerender({ view: view([refreshed]), detail: { task: refreshed, comments: [], activity: [] }, detailActions })
+    act(() => {
+      (title as HTMLInputElement).value = 'after'
+      title?.blur()
+    })
+
+    expect(onTitleChange).toHaveBeenCalledWith(card.id, 'after', 500)
   })
 
   it('ignores a blank composer entry', () => {

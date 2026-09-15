@@ -50,18 +50,39 @@ export type TasksSettingsCardProps = PropsHooks<TasksSettingsInjected['hooks']> 
   t: BoardTranslate
 }
 
-/** A number field that only writes once the entry parses. */
-function NumberField({ label, hint, value, min, writable, onCommit }: {
+/** The schema's ceiling on `digestSize`; the field refuses more rather than letting the save fail. */
+const DIGEST_SIZE_MAX = 200
+
+/**
+ * Read a field's text as an integer the schema accepts.
+ *
+ * The bounds restate the settings schema's, so an out-of-range entry is refused in the field — and
+ * reverted on blur — instead of reaching the host and failing the write there.
+ * @param text - what was typed.
+ * @param min - the smallest accepted value.
+ * @param max - the largest accepted value; absent when the schema sets none.
+ * @returns the integer, or undefined when the text is not one in range.
+ */
+export function boundedInteger(text: string, min: number, max?: number): number | undefined {
+  const parsed = Number.parseInt(text, 10)
+  if (!Number.isSafeInteger(parsed) || parsed < min) return undefined
+  if (max !== undefined && parsed > max) return undefined
+  return parsed
+}
+
+/** A number field that only writes once the entry parses within its bounds. */
+function NumberField({ label, hint, value, min, max, writable, onCommit }: {
   label: string
   hint: string
   value: number
   min: number
+  max?: number
   writable: boolean
   onCommit: (next: number) => void
 }) {
   const [draft, setDraft] = useState(String(value))
-  const parsed = Number.parseInt(draft, 10)
-  const invalid = !Number.isSafeInteger(parsed) || parsed < min
+  const parsed = boundedInteger(draft, min, max)
+  const invalid = parsed === undefined
   return (
     <label className={css.field}>
       <span className={css.label}>{label}</span>
@@ -73,7 +94,7 @@ function NumberField({ label, hint, value, min, writable, onCommit }: {
         aria-invalid={invalid}
         onChange={(event) => { setDraft(event.currentTarget.value) }}
         onBlur={() => {
-          if (invalid) { setDraft(String(value)); return }
+          if (parsed === undefined) { setDraft(String(value)); return }
           if (parsed !== value) onCommit(parsed)
         }}
       />
@@ -218,6 +239,7 @@ export function TasksSettingsCard({ useTaskSettings, setField, t }: TasksSetting
           hint={t('settings.digest.hint')}
           value={config.digestSize}
           min={1}
+          max={DIGEST_SIZE_MAX}
           writable={writable}
           onCommit={(next) => { void scopeSet('digestSize', next) }}
         />

@@ -9,12 +9,17 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Context, Service } from '@deepseek-ai/cordis'
 import TasksService, { Config } from '../../src/host/index.ts'
 import { TASKS_RPC_CHANNEL } from '../../src/host/protocol.ts'
 import { MAX_BODY_BYTES, endpointFromPath } from '../../src/host/channel.ts'
+import type { Task } from '../../src/domain/types.ts'
+import { FakeSessionStore } from './fake-harness.ts'
 
 interface Route {
   readonly kind: 'prefix' | 'exact'
@@ -72,10 +77,12 @@ afterEach(async () => {
 
 /**
  * Compose the plugin with a web server and connection, and serve the route table over HTTP.
+ * @param compose - provides extra harness services before the plugin starts.
  * @returns the base URL and the composed context.
  */
-async function serve(): Promise<{ base: string, ctx: Context }> {
+async function serve(compose: (ctx: Context) => void = () => {}): Promise<{ base: string, ctx: Context }> {
   const ctx = new Context()
+  compose(ctx)
   await ctx.plugin(FakeWebServer).await()
   await ctx.plugin(FakeConnection).await()
   const fiber = ctx.plugin(TasksService, new Config({} as never))
@@ -170,5 +177,36 @@ describe('endpointFromPath', () => {
     expect(endpointFromPath('/dsh-tasks', '/dsh-tasks/../api')).toBeUndefined()
     expect(endpointFromPath('/dsh-tasks', '/dsh-tasks/')).toBeUndefined()
     expect(endpointFromPath('/dsh-tasks', '/dsh-tasksx/board.read')).toBeUndefined()
+  })
+})
+
+describe('the task.move endpoint', () => {
+  it('refuses a drag move made against a card someone has changed since, as it refuses an edit', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-tasks-move-'))
+    mkdirSync(join(root, '.git'))
+    cleanup.push(async () => { rmSync(root, { recursive: true, force: true }) })
+    const sessions = new FakeSessionStore()
+    sessions.add('s1', root)
+    const { base, ctx } = await serve((composed) => { composed.provide('sessions', sessions as never) })
+
+    type Envelope = { result: { ok: true, value: Task } | { ok: false, error: { code: string, message: string } } }
+    const send = async (endpoint: string, payload: unknown): Promise<Envelope['result']> => {
+      const response = await call(base, endpoint, payload)
+      const body = await response.json() as Envelope
+      return body.result
+    }
+    const created = await send('task.create', { sessionId: 's1', task: { title: 'card', status: 'todo' } })
+    if (!created.ok) throw new Error(created.error.message)
+    const seen = created.value
+    // A later stamp than the one the dragging person saw, whatever the clock's resolution.
+    ctx.tasks.boardForCwd(root).update(seen.id, { title: 'renamed by the agent' }, { actor: 'agent' }, seen.updatedAt + 1000)
+
+    const stale = await send('task.move', { sessionId: 's1', taskId: seen.id, status: 'done', place: {}, expectedUpdatedAt: seen.updatedAt })
+    expect(stale.ok).toBe(false)
+    expect(!stale.ok && stale.error.code).toBe('bad-request')
+    expect(ctx.tasks.boardForCwd(root).detail(seen.id).task.status).toBe('todo')
+
+    const current = await send('task.move', { sessionId: 's1', taskId: seen.id, status: 'done', place: {}, expectedUpdatedAt: seen.updatedAt + 1000 })
+    expect(current.ok && current.value.status).toBe('done')
   })
 })

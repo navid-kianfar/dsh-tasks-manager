@@ -70,6 +70,8 @@ export function Kanban({
   // so reading the target from state would commit whatever the previous render saw. The refs are
   // what the drop reads; the state exists only to re-render the insertion marker.
   const dragRef = useRef<string | undefined>(undefined)
+  /** The dragged card's `updatedAt` at pick-up: what the person saw when the move began. */
+  const dragSeen = useRef(0)
   const dropRef = useRef<DropTarget | undefined>(undefined)
   const [dragId, setDragId] = useState<string | undefined>(undefined)
   const [drop, setDrop] = useState<DropTarget | undefined>(undefined)
@@ -101,6 +103,7 @@ export function Kanban({
    */
   function beginDrag(taskId: string): void {
     dragRef.current = taskId
+    dragSeen.current = tasks.find(task => task.id === taskId)?.updatedAt ?? 0
     setDragId(taskId)
   }
 
@@ -115,7 +118,7 @@ export function Kanban({
     clearDrag()
     if (id === undefined) return
     const column = (columns[status] ?? []).filter(task => task.id !== id)
-    onMove(id, status, neighbours(column, beforeId))
+    onMove(id, status, neighbours(column, beforeId), dragSeen.current)
   }
 
   /**
@@ -134,19 +137,19 @@ export function Kanban({
       event.preventDefault()
       // Landing at the head of the destination column keeps the moved card in view; landing at an
       // arbitrary depth would scroll it out from under the person who just moved it.
-      onMove(task.id, next, neighbours(columns[next] ?? [], (columns[next] ?? [])[0]?.id))
+      onMove(task.id, next, neighbours(columns[next] ?? [], (columns[next] ?? [])[0]?.id), task.updatedAt)
       return
     }
     if (event.key === 'ArrowUp' && at > 0) {
       event.preventDefault()
       const rest = column.filter(entry => entry.id !== task.id)
-      onMove(task.id, task.status, neighbours(rest, rest[at - 1]?.id))
+      onMove(task.id, task.status, neighbours(rest, rest[at - 1]?.id), task.updatedAt)
       return
     }
     if (event.key === 'ArrowDown' && at >= 0 && at < column.length - 1) {
       event.preventDefault()
       const rest = column.filter(entry => entry.id !== task.id)
-      onMove(task.id, task.status, neighbours(rest, rest[at + 1]?.id))
+      onMove(task.id, task.status, neighbours(rest, rest[at + 1]?.id), task.updatedAt)
     }
   }
 

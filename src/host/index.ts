@@ -674,6 +674,9 @@ export class TasksService extends Service {
           } as TaskPatch,
           author,
           now,
+          // The same precondition an edit carries: a drop computed against a card someone has since
+          // moved or changed would otherwise land on top of their change.
+          readOptionalTimestamp(payload, 'expectedUpdatedAt'),
         )
       case 'task.archive':
         return (await this.boardForSession(sessionId)).setArchived(

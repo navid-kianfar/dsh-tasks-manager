@@ -26,6 +26,7 @@ import type { TasksApi } from './rpc.ts'
 import { TasksApiError } from './rpc.ts'
 import { BoardScreen } from './board/BoardScreen.tsx'
 import { ConfirmDialog, type ConfirmRequest } from './board/ConfirmDialog.tsx'
+import { expectedStamp, recordOwnWrite } from './edit-stamps.ts'
 import type { BoardTranslate } from './board/contract.ts'
 
 /** What the slot registration injects into this view. */
@@ -110,6 +111,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
   const [promoted, setPromoted] = useState<string[]>([])
   const pollIntervalMs = useTaskSettings(snapshot => snapshot.value?.pollIntervalMs ?? FALLBACK_POLL_MS)
   const canDispatch = useTaskSettings(snapshot => (snapshot.value?.subagentProvider ?? '') !== '')
+  const defaultStatus = useTaskSettings(snapshot => snapshot.value?.defaultStatus)
   // Deleting is always offered to the PERSON whose board this is; `allowDelete` gates the model's
   // tool, not this UI, and hiding the control here would leave no way to remove a card by hand.
   const canDelete = true
@@ -130,13 +132,19 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
   const revision = useRef(-1)
   const alive = useRef(true)
   /**
-   * Field edits run one after another. Each carries the card's `updatedAt` as a precondition, and
-   * two edits sent together would carry the same one — the second then conflicts with the first,
-   * the person's own edit. Chained, each sends the stamp its predecessor returned.
+   * Field edits and moves run one after another. Each carries the card's `updatedAt` as the person
+   * saw it when they began, and two sent together from one stamp would make the second conflict with
+   * the first — the person's own change. Chained, each is carried past its predecessors' own writes.
    */
   const edits = useRef<Promise<void>>(Promise.resolve())
-  /** The newest `updatedAt` this view has seen per card, from reads and from its own writes. */
+  /**
+   * The newest `updatedAt` this view has seen per card, from reads and from its own writes. Only the
+   * start stamp of a control that commits the moment it is used (a select, a picker) comes from here;
+   * a typed edit or a drag brings the stamp it began at.
+   */
   const stamps = useRef(new Map<string, number>())
+  /** Per card, the stamps this view's own conditional writes moved it through (see `edit-stamps`). */
+  const ownWrites = useRef(new Map<string, Map<number, number>>())
   useEffect(() => {
     alive.current = true
     return () => { alive.current = false }
@@ -293,18 +301,41 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     setDetail(current => (current === null || current.task.id !== task.id ? current : { ...current, task }))
   }, [query.archived])
 
-  const patch = useCallback((taskId: string, value: TaskPatch) => {
+  /**
+   * Queue one conditional write behind the ones before it.
+   *
+   * The stamp is fixed when the change begins — `seen`, or the newest read for a control that commits
+   * as it is used — and carried forward at send time only through this view's own writes. A stamp
+   * read at send time would instead include whatever a poll brought in while the person was editing,
+   * and the write would overwrite a change they never saw.
+   * @param taskId - the card being changed.
+   * @param seen - the card's `updatedAt` when the change began, when the control knows it.
+   * @param send - performs the call with the precondition to send, and returns the updated card.
+   */
+  const conditional = useCallback((
+    taskId: string,
+    seen: number | undefined,
+    send: (expectedUpdatedAt: number | undefined) => Promise<BoardView['tasks'][number]>,
+  ): void => {
+    const started = seen ?? stamps.current.get(taskId)
     const next = edits.current.then(() => mutate(async () => {
-      const expectedUpdatedAt = stamps.current.get(taskId)
-      const request = expectedUpdatedAt === undefined
-        ? { sessionId, taskId, patch: value }
-        : { sessionId, taskId, patch: value, expectedUpdatedAt }
-      applyTask(await api.call('task.update', request))
+      const own = ownWrites.current.get(taskId) ?? new Map<number, number>()
+      ownWrites.current.set(taskId, own)
+      const expectedUpdatedAt = started === undefined ? undefined : expectedStamp(started, own)
+      const task = await send(expectedUpdatedAt)
+      if (expectedUpdatedAt !== undefined) recordOwnWrite(own, expectedUpdatedAt, task.updatedAt)
+      applyTask(task)
       if (openId === taskId) await loadDetail(taskId)
     }))
     edits.current = next
     void next
-  }, [mutate, applyTask, api, sessionId, openId, loadDetail])
+  }, [mutate, applyTask, openId, loadDetail])
+
+  const patch = useCallback((taskId: string, value: TaskPatch, seen?: number) => {
+    conditional(taskId, seen, expectedUpdatedAt => api.call('task.update', expectedUpdatedAt === undefined
+      ? { sessionId, taskId, patch: value }
+      : { sessionId, taskId, patch: value, expectedUpdatedAt }))
+  }, [conditional, api, sessionId])
 
   const promote = useCallback((content: string) => {
     void mutate(async () => {
@@ -314,18 +345,21 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
     })
   }, [mutate, api, sessionId, loadBoard, query])
 
-  const create = useCallback((title: string, status: TaskStatus) => {
+  const create = useCallback((title: string, status: TaskStatus | undefined) => {
     void mutate(async () => {
-      await api.call('task.create', { sessionId, task: { title, status } })
+      // No status is how the host is asked for its configured default column.
+      await api.call('task.create', { sessionId, task: status === undefined ? { title } : { title, status } })
       await loadBoard(query)
     })
   }, [mutate, api, sessionId, loadBoard, query])
 
-  const move = useCallback((taskId: string, status: TaskStatus, place: TaskPlacement) => {
-    void mutate(async () => {
-      applyTask(await api.call('task.move', { sessionId, taskId, status, place }))
-    })
-  }, [mutate, applyTask, api, sessionId])
+  // Through the same queue and precondition as an edit: a refused move re-reads the board and says
+  // why, rather than dropping the card over a change someone else made.
+  const move = useCallback((taskId: string, status: TaskStatus, place: TaskPlacement, seen: number) => {
+    conditional(taskId, seen, expectedUpdatedAt => api.call('task.move', expectedUpdatedAt === undefined
+      ? { sessionId, taskId, status, place }
+      : { sessionId, taskId, status, place, expectedUpdatedAt }))
+  }, [conditional, api, sessionId])
 
   const archive = useCallback((taskId: string, archived: boolean) => {
     void mutate(async () => {
@@ -402,6 +436,7 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
         assigneesAvailable={assignees.available}
         onRefresh={() => { void refresh() }}
         onCreate={create}
+        defaultStatus={defaultStatus}
         onJobRead={jobRead}
         onJobKill={jobKill}
         taskActions={{
@@ -414,8 +449,8 @@ export function TasksView({ api, useTaskSettings, useProjection, sessionId, t }:
         }}
         detailActions={{
           onClose: () => { setOpenId(undefined) },
-          onTitleChange: (taskId, title) => { patch(taskId, { title }) },
-          onBodyChange: (taskId, body) => { patch(taskId, { body: body.trim() === '' ? null : body }) },
+          onTitleChange: (taskId, title, seen) => { patch(taskId, { title }, seen) },
+          onBodyChange: (taskId, body, seen) => { patch(taskId, { body: body.trim() === '' ? null : body }, seen) },
           onStatusChange: (taskId, status) => { patch(taskId, { status }) },
           onPriorityChange: (taskId, priority: TaskPriority) => { patch(taskId, { priority }) },
           onLabelsChange: (taskId, labels) => { patch(taskId, { labels: labels.length === 0 ? null : labels }) },

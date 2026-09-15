@@ -48,8 +48,12 @@ export interface SortState {
 export interface TaskActions {
   /** Open the card's detail. */
   onOpen: (taskId: string) => void
-  /** Move a card to a column, at the position its new neighbours describe. */
-  onMove: (taskId: string, status: TaskStatus, place: TaskPlacement) => void
+  /**
+   * Move a card to a column, at the position its new neighbours describe.
+   * `seenUpdatedAt` is the card's `updatedAt` when the move began (at pick-up, for a drag), which the
+   * host checks so a move cannot land over a change the person never saw.
+   */
+  onMove: (taskId: string, status: TaskStatus, place: TaskPlacement, seenUpdatedAt: number) => void
   /** Archive or restore a card. */
   onArchive: (taskId: string, archived: boolean) => void
   /** Permanently delete a card. */
@@ -166,10 +170,13 @@ export interface TaskDetailProps {
   knownLabels: readonly string[]
   /** Close the panel. */
   onClose: () => void
-  /** Rename the card. */
-  onTitleChange: (taskId: string, title: string) => void
-  /** Rewrite the card's Markdown detail. */
-  onBodyChange: (taskId: string, body: string) => void
+  /**
+   * Rename the card. `seenUpdatedAt` is the card's `updatedAt` when the person began editing the
+   * title, not when they committed it: a refresh while they typed must not become their precondition.
+   */
+  onTitleChange: (taskId: string, title: string, seenUpdatedAt: number) => void
+  /** Rewrite the card's Markdown detail; `seenUpdatedAt` is taken when the editor was opened. */
+  onBodyChange: (taskId: string, body: string, seenUpdatedAt: number) => void
   /** Move the card to a column. */
   onStatusChange: (taskId: string, status: TaskStatus) => void
   /** Change the card's priority. */
@@ -262,8 +269,13 @@ export interface BoardScreenProps {
   assigneesAvailable: boolean
   /** Re-read the board now. */
   onRefresh: () => void
-  /** Add a card. */
-  onCreate: (title: string, status: TaskStatus) => void
+  /**
+   * The deployment's `defaultStatus`, where the board's own composer creates a card; absent while
+   * the settings are unread, when the host applies it instead.
+   */
+  defaultStatus?: TaskStatus | undefined
+  /** Add a card, in `status`, or in the host's configured default column when it is undefined. */
+  onCreate: (title: string, status: TaskStatus | undefined) => void
   /** Everything the detail panel can do. */
   detailActions: Omit<
     TaskDetailProps,

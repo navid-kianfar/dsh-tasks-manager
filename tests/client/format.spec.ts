@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import {
   activeFilterCount,
   collectLabels,
+  composerStatus,
   describeActivity,
   describeDue,
   duration,
@@ -155,5 +156,25 @@ describe('activeFilterCount', () => {
     expect(activeFilterCount({ status: [] })).toBe(0)
     expect(activeFilterCount({ search: '' })).toBe(0)
     expect(activeFilterCount({ status: ['todo'], search: 'x', archived: 'all' })).toBe(3)
+  })
+})
+
+describe('composerStatus', () => {
+  it('uses the configured default column when no filter narrows the board', () => {
+    expect(composerStatus(undefined, 'todo')).toBe('todo')
+    expect(composerStatus([], 'in_progress')).toBe('in_progress')
+  })
+
+  it('keeps the default when the status filter still shows that column', () => {
+    expect(composerStatus(['done', 'todo'], 'todo')).toBe('todo')
+  })
+
+  it('lands in a filtered column when the default one is filtered out, so the new card stays in view', () => {
+    expect(composerStatus(['blocked', 'done'], 'backlog')).toBe('blocked')
+  })
+
+  it('leaves the column to the host while the settings are unread, rather than guessing backlog', () => {
+    expect(composerStatus(undefined, undefined)).toBeUndefined()
+    expect(composerStatus(['done'], undefined)).toBe('done')
   })
 })

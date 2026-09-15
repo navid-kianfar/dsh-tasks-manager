@@ -9,7 +9,7 @@
  * @module @achasoft/dsh-tasks-manager/client/board/format
  */
 
-import type { Task, TaskActivity } from '../../domain/types.ts'
+import type { Task, TaskActivity, TaskStatus } from '../../domain/types.ts'
 import type { BoardTranslate, SortColumn, SortState } from './contract.ts'
 
 /** Milliseconds in one day, for the due-date and relative-time bands. */
@@ -196,4 +196,25 @@ export function activeFilterCount(query: {
   if ((query.search ?? '') !== '') count++
   if (query.archived !== undefined && query.archived !== 'active') count++
   return count
+}
+
+/**
+ * The column a card typed into the board's own composer lands in.
+ *
+ * The composer sits above the board, in no column, so the deployment's `defaultStatus` decides —
+ * the same column the host gives a card created without one. The one exception is a status filter
+ * that hides that column: the card would be created and vanish at once, so it lands in the first
+ * column the filter shows instead. A column's own quick-add never comes here; that column wins.
+ * @param filter - the board's status filter, when one is set.
+ * @param defaultStatus - the configured default column, or undefined while settings are unread.
+ * @returns the column to create in, or undefined to let the host apply its configured default.
+ */
+export function composerStatus(
+  filter: readonly TaskStatus[] | undefined,
+  defaultStatus: TaskStatus | undefined,
+): TaskStatus | undefined {
+  const [first] = filter ?? []
+  if (first === undefined) return defaultStatus
+  if (defaultStatus !== undefined && filter?.includes(defaultStatus) === true) return defaultStatus
+  return first
 }
