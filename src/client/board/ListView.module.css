@@ -183,7 +183,8 @@
 }
 
 .priority[data-priority='low'] {
-  color: var(--dsw-alias-label-dimmed);
+  /* Tertiary, not dimmed: dimmed is the disabled tone and read as missing text on a card. */
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .due {

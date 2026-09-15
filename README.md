@@ -2,7 +2,7 @@
 
 A project task board for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`). Each project gets a SQLite database at `<project>/.dsh/tasks.db`. The Web Client gets a **Tasks** tab with a kanban board, a list view, the session's `todo_write` checklist, and a panel of background jobs. The model gets tools to add, list, update, and comment on cards. When a subagent provider is configured, you can dispatch a card to run as a background job; the result is recorded on the card.
 
-![The Tasks tab showing the kanban board with Backlog, To do, In progress, Blocked and Done columns, one card marked Running, and the database path in the footer](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-board.png)
+![The Tasks tab showing the kanban board with Backlog, To do, In progress, Blocked and Done columns, priorities, labels, due dates, and the database path in the footer](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-board.png)
 
 ## Features
 
@@ -13,7 +13,7 @@ A **Tasks** tab sits beside Chat and Trajectory in every session and shows the b
 - **Board**: five columns (`backlog`, `todo`, `in_progress`, `blocked`, `done`) with drag and drop between and within columns, a quick-add per column, and a per-card menu (Open, Dispatch to agent, Stop the background run, Archive or Restore, Delete permanently).
 - **List**: one row per card, sortable by column.
 
-![The List layout with cards sorted by priority, showing ref, title, status, priority, labels, assignee, due date, and updated columns](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-list-view.png)
+![The List layout showing ref, title, labels, status, priority, assignee, due date, and updated columns](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-list-view.png)
 
 The open board polls a revision counter every `pollIntervalMs` and re-reads cards only when it changes. Changes made by the agent, another session, another `dsh` process, or `sqlite3` therefore appear without a reload.
 
@@ -23,7 +23,7 @@ Opening a card shows an editable title, a Markdown description, status and prior
 
 The **Assignee** picker lists people who have committed to the project, from `git log` (last 5,000 commits), ranked by commit count, with the identity from `git config user.email` marked *you*. A value already on a card that is not in the history stays selectable. In a directory without git history, the picker says so.
 
-![A card detail panel with a Markdown description, the assignee picker open on the project's committers, labels, a due date, two comments, and "Last run: completed"](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-card-detail.png)
+![A card detail panel with status, priority, assignee, due date, labels, and a Markdown description with a checklist](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-card-detail.png)
 
 Field edits made in the detail, and moves on the board (drag or keyboard), are sent with the card's `updatedAt` as it was when the change began: when you entered the title or opened the description editor, or picked the card up. Your own earlier edits to the card carry that stamp forward. If anyone else changed the card in the meantime, the change is refused, the board shows the message, and the board and card reload.
 
@@ -31,13 +31,9 @@ Field edits made in the detail, and moves on the board (drag or keyboard), are s
 
 The **Session** layout shows the checklist the assistant keeps with `todo_write` for this session, with progress, and an **Add to board** action that copies an unfinished step onto the board.
 
-![The Session layout showing a four-step checklist, two steps done, and one step already added to the board](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-session-checklist.png)
-
 ### Background jobs and dispatch
 
 The **Background** layout lists every background job the session can see: shell commands, subagents, and dispatched cards, with status, elapsed time, and a **Stop** control. **Read output** shows a dispatched card's final report. For other job kinds the output is withheld, because the job registry has one consuming read cursor per job, and that cursor belongs to the agent's `job_output`.
-
-![The Background layout listing a running dispatched card "#14 Rotate staging keys", a completed shell job, and the output of an earlier dispatched run](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-background-panel.png)
 
 When `subagentProvider` is set, **Dispatch to agent** starts the card as a background job on that subagent provider. The prompt includes the card's title, status, priority, labels, assignee, description, and comments. While it runs:
 
@@ -52,7 +48,7 @@ Deleting a running card first stops its run, acting as the session that owns the
 
 **Settings → Plugins → Task management** edits the fields marked in [Configuration](#configuration).
 
-![The Task management settings card expanded, showing database location, column and position for new tasks, refresh interval, subagent for dispatch set to "spawn", dispatch column moves, and digest size](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-settings-card.png)
+![The Task management settings card expanded, showing database location, column and position for new tasks, refresh interval, subagent for dispatch, dispatch column moves, and digest size](https://raw.githubusercontent.com/navid-kianfar/dsh-tasks-manager/main/docs/screenshots/tasks-settings-card.png)
 
 ## Requirements
 
