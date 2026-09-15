@@ -41,6 +41,7 @@ import { TaskValidationError, parseCommentIdText, parseTaskId } from '../domain/
 import { TaskNotFoundError, TaskStoreRegistry, type TaskAuthor, type TaskStore } from './store.ts'
 import { DEFAULT_DATABASE_PATH, JOURNAL_MODES, TaskStoreError, type JournalMode } from './db.ts'
 import { projectRootFor } from './project-root.ts'
+import { mountChannel } from './channel.ts'
 import { GitAuthorDirectory } from './git-authors.ts'
 import {
   TASKS_RPC_CHANNEL,
@@ -300,16 +301,10 @@ export class TasksService extends Service {
       onChange: () => { this.rebuild() },
     })
 
-    // The channel needs the caller's own `webServer` (`connection.rpc.handle` registers a route
-    // through it), so both are injected together and a headless deployment simply gets no channel —
+    // Mounted by this plugin rather than through `connection.rpc.handle`, which cannot mount a route
+    // for a plugin on the shipped harness — see ./channel.ts. A headless deployment gets no channel;
     // the tools and the database still work there.
-    ctx.inject(['connection', 'webServer'], (rpcCtx) => {
-      rpcCtx.connection.rpc.handle(
-        TASKS_RPC_CHANNEL,
-        (endpoint, payload, signal) => this.routeRpc(endpoint, payload, signal),
-        { authority: 'trusted-host' },
-      )
-    })
+    mountChannel(ctx, TASKS_RPC_CHANNEL, (endpoint, payload, signal) => this.routeRpc(endpoint, payload, signal))
 
     ctx.effect(() => () => { this.registry.close() }, 'dsh-tasks: close boards')
   }
