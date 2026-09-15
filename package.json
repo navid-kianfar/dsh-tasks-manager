@@ -62,7 +62,6 @@
     "@deepseek-ai/dsh-host-apiproxy": "*",
     "@deepseek-ai/dsh-jobs": "*",
     "@deepseek-ai/dsh-session": "*",
-    "@deepseek-ai/dsh-settings": "*",
     "@deepseek-ai/dsh-tool-todo": "*",
     "@deepseek-ai/dsh-tools": "*",
     "@deepseek-ai/dsh-typert-protocol": "*",
